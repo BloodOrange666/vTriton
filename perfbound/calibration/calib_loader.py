@@ -84,13 +84,15 @@ def _load_bandwidth_csv(db: CalibrationDB, csv_path: Path) -> None:
     import csv
 
     with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            src = row["src_mem"].strip()
-            dst = row["dst_mem"].strip()
-            core_num = int(row.get("core_num", -1))
-            bw = MemBandwidth.from_csv_row(row)
-            db.memory.bw[(src, dst, core_num)] = bw
+        # Skip comment lines (starting with #)
+        lines = [line for line in f if not line.strip().startswith("#")]
+    reader = csv.DictReader(lines)
+    for row in reader:
+        src = row["src_mem"].strip().lower()
+        dst = row["dst_mem"].strip().lower()
+        core_num = int(row.get("core_num", -1))
+        bw = MemBandwidth.from_csv_row(row)
+        db.memory.bw[(src, dst, core_num)] = bw
 
 
 def validate_calibration(db: CalibrationDB) -> list[str]:

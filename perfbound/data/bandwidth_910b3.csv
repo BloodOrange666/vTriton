@@ -1,0 +1,79 @@
+# Ascend 910B3 sustained bandwidth seeds (FORMAT TEMPLATE — ALL VALUES ARE SEEDS)
+#
+# Schema: tilesim core/config/arc_config/910B1/bandwidth_910B1.csv
+# Columns: src_mem,dst_mem,core_num,pkt_size,mode,bandwidth(GB/s)
+#
+# Memory space labels (910B3 convention):
+#   GM  — Global Memory (HBM)
+#   L2  — Shared L2 cache
+#   L1  — Cube data staging buffer (per-AIC)
+#   L0A — Left matrix input register file (A matrix)
+#   L0B — Right matrix input register file (B matrix)
+#   L0C — Cube output accumulator
+#   UB  — Unified Buffer (Vector compute space)
+#
+# core_num: -1 = core-count-independent; 1..20 = per-core-count bandwidth
+# pkt_size: -1 = size-independent (use for large transfers)
+# mode: normal (default sustained bandwidth)
+#
+# PROVENANCE WARNING: All values are scaled from 910B1 measurements.
+# 910B3 ≠ 910B1 — every P0 path MUST be re-measured via CCE DMA sweep
+# microbench on real 910B3 hardware before any I_c enters the bound.
+# See A.0 plan §6 Calibration Provenance.
+#
+src_mem,dst_mem,core_num,pkt_size,mode,bandwidth(GB/s)
+# ── Core-count-independent paths ──
+GM,L1,-1,-1,normal,135
+GM,L2,-1,-1,normal,1638.4
+L2,L1,-1,-1,normal,221
+L2,UB,-1,-1,normal,137
+L1,L0A,-1,-1,normal,441
+L1,L0B,-1,-1,normal,220.5
+L1,L2,-1,-1,normal,221
+L0C,GM,-1,-1,normal,70
+L0C,L1,-1,-1,normal,70
+L0C,L2,-1,-1,normal,70
+GM,L0B,-1,-1,normal,104.5
+UB,L2,-1,-1,normal,93
+# ── GM→UB per-core-count (910B3: 20 AIC max, seed from 910B1 scaled) ──
+GM,UB,1,-1,normal,100.9
+GM,UB,2,-1,normal,64.5
+GM,UB,3,-1,normal,88.3
+GM,UB,4,-1,normal,77.9
+GM,UB,5,-1,normal,84.9
+GM,UB,6,-1,normal,80.8
+GM,UB,7,-1,normal,73.3
+GM,UB,8,-1,normal,68.9
+GM,UB,9,-1,normal,73.2
+GM,UB,10,-1,normal,67.6
+GM,UB,11,-1,normal,71.1
+GM,UB,12,-1,normal,68.1
+GM,UB,13,-1,normal,69.1
+GM,UB,14,-1,normal,72.6
+GM,UB,15,-1,normal,75.0
+GM,UB,16,-1,normal,73.3
+GM,UB,17,-1,normal,72.1
+GM,UB,18,-1,normal,70.7
+GM,UB,19,-1,normal,73.3
+GM,UB,20,-1,normal,68.8
+# ── UB→GM per-core-count ──
+UB,GM,1,-1,normal,188.5
+UB,GM,2,-1,normal,210.5
+UB,GM,3,-1,normal,117.3
+UB,GM,4,-1,normal,130.3
+UB,GM,5,-1,normal,109.0
+UB,GM,6,-1,normal,119.5
+UB,GM,7,-1,normal,117.3
+UB,GM,8,-1,normal,115.0
+UB,GM,9,-1,normal,112.8
+UB,GM,10,-1,normal,110.5
+UB,GM,11,-1,normal,108.2
+UB,GM,12,-1,normal,106.0
+UB,GM,13,-1,normal,103.7
+UB,GM,14,-1,normal,101.5
+UB,GM,15,-1,normal,100.1
+UB,GM,16,-1,normal,100.4
+UB,GM,17,-1,normal,96.8
+UB,GM,18,-1,normal,98.8
+UB,GM,19,-1,normal,90.4
+UB,GM,20,-1,normal,88.9
