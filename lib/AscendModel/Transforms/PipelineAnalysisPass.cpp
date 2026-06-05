@@ -435,6 +435,21 @@ struct PipelineAnalysisPass
     
     // Generate trace with loop unrolling (limit to 100 iterations for visualization)
     generatePerfettoTrace(scheduler, "pipeline_trace.json", oneIterCycles, rooflineTotalCycles, 100);
+
+    // Emit dependency graph JSON for downstream performance bound model consumers
+    // (perfbound/model/serialization.py mandatory/avoidable split)
+    {
+      std::error_code depEC;
+      llvm::raw_fd_ostream depFile("pipeline_dep_graph.json", depEC,
+                                    llvm::sys::fs::OF_Text);
+      if (!depEC) {
+        scheduler.emitDependencyGraphJSON(depFile);
+        llvm::outs() << "Dependency graph: pipeline_dep_graph.json\n";
+      } else {
+        llvm::errs() << "Warning: could not write pipeline_dep_graph.json: "
+                     << depEC.message() << "\n";
+      }
+    }
   }
 };
 
