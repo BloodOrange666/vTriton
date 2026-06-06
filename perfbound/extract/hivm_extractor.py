@@ -47,6 +47,13 @@ class OpRecord:
     src_space: str = ""
     dst_space: str = ""
 
+    # Repeat/mask/SIMD-lane params (for Gap 4 intra-unit attribution).
+    # Future-populated: HIVMAnalysis does not yet emit repeat/mask in its
+    # JSON output.  Until the C++ emitter exposes these, both default to
+    # their fully-utilized values (repeat=1, mask=0).
+    repeat: int = 1       # repeat count (>1 means the op iterates internally)
+    mask: int = 0         # mask lanes disabled (0 = all lanes active)
+
     # Scheduling (from PipelineScheduler JSON)
     start_cycle: int = 0
     end_cycle: int = 0
@@ -121,6 +128,8 @@ def load_hivm_desgraph(path: Path | str) -> List[OpRecord]:
             depends_on=node.get("depends_on", []),
             src_space=node.get("src_space", ""),
             dst_space=node.get("dst_space", ""),
+            repeat=node.get("repeat", 1),
+            mask=node.get("mask", 0),
         ))
     return ops
 

@@ -25,6 +25,8 @@ from ..model.grid_model import GridBound
 from ..model.component_model import ComponentBound
 from ..model.serialization import SerializationSplit
 from ..extract.op_classifier import Component
+from ..extract.hivm_extractor import HIVMExtract
+from ..extract.eligibility_oracle import get_eligibility
 
 
 class BindingTier(str, Enum):
@@ -107,6 +109,8 @@ def combine(
     component: ComponentBound,
     serial: SerializationSplit,
     kernel_name: str = "unknown",
+    extract: Optional[HIVMExtract] = None,
+    calibration: Optional[dict] = None,
 ) -> BoundResult:
     """Combine Tier 1 + Tier 2 + serialization into a single conservative bound.
 
@@ -118,16 +122,21 @@ def combine(
 
     The five-way attribution is initialized from the component model's
     per-component rates and the serialization split.  Gap 3 comes directly
-    from the avoidable serialization sum.
+    from the avoidable serialization sum.  When an HIVM extract is provided,
+    Gaps 1, 2, and 4 are estimated from per-op data.
 
     Args:
         grid: Tier 1 grid floor.
         component: Tier 2 component floor with per-component decomposition.
         serial: Mandatory/avoidable serialization split.
         kernel_name: Label for the result.
+        extract: Optional M3 HIVM extract for per-op Gap 1/2/4 computation.
+        calibration: Optional dict with keys "cube", "vector", "memory", "core"
+                     for rate-based gap quantification.  If omitted, gap
+                     estimates use proportional allocation from component times.
 
     Returns:
-        BoundResult with T_bound, binding tier/component, and initial attribution.
+        BoundResult with T_bound, binding tier/component, and attribution.
     """
     # Compute the max of the two independent floors
     max_floor_us = max(grid.t_grid_floor_us, component.t_core_floor_us)
@@ -146,12 +155,12 @@ def combine(
     # Attribution: initialize from available data
     attribution = Attribution()
 
-    # Gap 2 (coalescing/MTE-E): from per-component MTE rates vs peak
     # Gap 3 (avoidable serial): directly from serialization split
     attribution.gap3_avoidable_serial_us = serial.t_serial_avoidable_us
 
-    # Gap 4 (intra-unit execution): compute units with less-than-peak efficiency
-    # For now, initialized from the component rates
+    # Gap 1/2/4 from extract data
+    if extract is not None:
+        _wire_gaps(attribution, extract, component, calibration)
 
     # Convert gaps to fractions
     if t_bound_us > 0:
@@ -171,3 +180,226 @@ def combine(
         binding_component=binding_component,
         attribution=attribution,
     )
+
+
+# ── Gap helpers (diagnostic only — not part of the bound) ──────────────────
+
+# Op-name prefixes for eligibility category lookup
+_MATMUL_KEYWORDS = ("matmul", "mm", "bmm")
+_REDUCTION_KEYWORDS = ("reduce", "sum", "max", "min", "arg")
+_COMPARE_KEYWORDS = ("cmp", "compare")
+
+
+def _op_category(op_name: str) -> str:
+    """Map an op name to an eligibility-oracle category."""
+    lower = op_name.lower()
+    if any(k in lower for k in _MATMUL_KEYWORDS):
+        return "matmul"
+    if any(k in lower for k in _REDUCTION_KEYWORDS):
+        return "reduction"
+    if any(k in lower for k in _COMPARE_KEYWORDS):
+        return "compare"
+    return "elementwise"
+
+
+def _compute_gap1(
+    extract: HIVMExtract,
+    component: ComponentBound,
+) -> float:
+    """Estimate Gap 1: wrong-unit placement cost.
+
+    For each compute op whose realized (assigned) component is NOT in the
+    eligible set, estimate its contribution to the component's total time.
+    Over-estimation is safe here — gap attribution is diagnostic, not part
+    of T_bound, and over-counting serves as a flag to the user.
+
+    Returns:
+        Estimated wrong-unit time in microseconds.
+    """
+    gap1_us = 0.0
+
+    for op in extract.operations:
+        # MTE and Scalar have fixed assignment — no placement choice
+        if op.component in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
+            continue
+        if op.component == Component.SCALAR:
+            continue  # scalar ops are always on the scalar pipe
+
+        category = _op_category(op.op_name)
+        prec_str = op.precision.value if op.precision else None
+        eligible = get_eligibility(category, prec_str)
+
+        if op.component not in eligible:
+            # Mis-placed: count its share of the realized component's time
+            comp_str = op.component.value
+            if comp_str not in component.per_component_us:
+                continue
+            comp_time = component.per_component_us[comp_str]
+            if comp_time <= 0:
+                continue
+
+            # Estimate this op's share of the component's total work.
+            # Use flops fallback when elements is 0 (C++ JSON for Cube ops).
+            if op.elements > 0:
+                op_work = float(op.elements)
+            elif op.flops > 0:
+                op_work = float(op.flops)
+            else:
+                continue  # no work to attribute — skip
+            op_work *= float(op.loop_multiplier)
+
+            total_work = component.total_ops.get(comp_str, 0) or component.total_bytes.get(comp_str, 0)
+            if total_work <= 0:
+                continue
+
+            op_share = op_work / total_work
+            gap1_us += comp_time * op_share
+
+    return gap1_us
+
+
+def _compute_gap2(
+    extract: HIVMExtract,
+    calibration: Optional[dict] = None,
+) -> float:
+    """Estimate Gap 2: coalescing / transfer-efficiency gap.
+
+    For each MTE op, compare the time at its actual transfer size
+    (which may incur small-packet amortization) vs ideal large-packet BW.
+
+    Returns:
+        Estimated coalescing gap in microseconds.
+    """
+    if calibration is None:
+        return 0.0
+
+    memory = calibration.get("memory")
+    if memory is None:
+        return 0.0
+
+    gap2_us = 0.0
+
+    for op in extract.operations:
+        if op.component not in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
+            continue
+        if op.bytes_transferred <= 0:
+            continue
+
+        # Determine src/dst path
+        if op.component == Component.MTE_GM:
+            src, dst = "gm", "ub"
+        elif op.component == Component.MTE_L1:
+            src, dst = "l1", "l0a"
+        elif op.component == Component.MTE_UB:
+            src, dst = "ub", "gm"
+        else:
+            continue
+
+        try:
+            # Ideal: large-packet BW (pkt_size=-1)
+            bw_ideal, _ = memory.lookup_bw(src, dst, pkt_size=-1)
+            # Actual: with per-transfer size
+            bw_actual, _ = memory.lookup_bw(src, dst, pkt_size=op.bytes_transferred)
+        except KeyError:
+            continue
+
+        if bw_ideal <= 0 or bw_actual <= 0:
+            continue
+
+        total_bytes = float(op.bytes_transferred) * float(op.loop_multiplier)
+        t_ideal = total_bytes / bw_ideal
+        t_actual = total_bytes / bw_actual
+        gap2_us += max(0.0, t_actual - t_ideal)
+
+    return gap2_us
+
+
+def _compute_gap4(
+    extract: HIVMExtract,
+    component: ComponentBound,
+    calibration: Optional[dict] = None,
+) -> float:
+    """Estimate Gap 4: intra-unit execution inefficiency.
+
+    For compute ops (Cube, Vector), use repeat/mask fields to estimate
+    SIMD/fractal utilization.  With default values (repeat=1, mask=0)
+    utilization is 100% and Gap 4 = 0.
+
+    Note: repeat/mask are future-populated fields from the C++ emitter.
+    Until HIVMAnalysis exposes per-op repeat and mask in its JSON output,
+    Gap 4 will always be 0.0 for real HIVM data (conservative default).
+
+    Returns:
+        Estimated intra-unit inefficiency in microseconds.
+    """
+    gap4_us = 0.0
+
+    for op in extract.operations:
+        if op.component not in (Component.CUBE, Component.VECTOR):
+            continue
+
+        # Compute utilization from repeat/mask
+        if op.component == Component.VECTOR:
+            # Vector: mask disables lanes (128-wide SIMD)
+            active_lanes = max(0, 128 - op.mask)
+            utilization = active_lanes / 128.0
+        else:
+            # Cube: repeat > 1 means internal iterations
+            utilization = 1.0 / max(1, op.repeat)
+
+        if utilization >= 1.0:
+            continue  # fully utilized — no gap
+
+        # Estimate this op's time on its component.
+        # Use op.flops as fallback when op.elements is 0 (C++ JSON path
+        # may emit flops but not elements for Cube ops).
+        comp_str = op.component.value
+        if op.elements > 0:
+            op_work = float(op.elements)
+        elif op.flops > 0:
+            op_work = float(op.flops)
+        else:
+            continue  # no work to attribute — skip
+        op_work *= float(op.loop_multiplier)
+
+        if comp_str in component.total_ops and component.total_ops[comp_str] > 0:
+            total_work = component.total_ops[comp_str]
+            if comp_str in component.per_component_us:
+                comp_time = component.per_component_us[comp_str]
+                op_time = comp_time * (op_work / total_work)
+            else:
+                continue
+        elif comp_str in component.total_bytes and component.total_bytes[comp_str] > 0:
+            total_work = component.total_bytes[comp_str]
+            if comp_str in component.per_component_us:
+                comp_time = component.per_component_us[comp_str]
+                op_time = comp_time * (op_work / total_work)
+            else:
+                continue
+        else:
+            continue
+
+        # Gap 4 = time lost to sub-optimal utilization
+        gap4_us += (1.0 - utilization) * op_time
+
+    return gap4_us
+
+
+def _wire_gaps(
+    attribution: Attribution,
+    extract: HIVMExtract,
+    component: ComponentBound,
+    calibration: Optional[dict] = None,
+) -> None:
+    """Populate Gap 1/2/4 into an Attribution from extract data."""
+    gap1 = _compute_gap1(extract, component)
+    if gap1 > 0:
+        attribution.gap1_wrong_unit_us = gap1
+
+    gap2 = _compute_gap2(extract, calibration)
+    if gap2 > 0:
+        attribution.gap2_coalescing_us = gap2
+
+    gap4 = _compute_gap4(extract, component, calibration)
+    if gap4 > 0:
+        attribution.gap4_intra_unit_exec_us = gap4

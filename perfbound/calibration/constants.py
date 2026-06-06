@@ -257,7 +257,7 @@ class MemBandwidth:
     @property
     def bw_bytes_per_us(self) -> float:
         """Bandwidth in bytes per microsecond (single core)."""
-        return self.bw_gb_per_s * 1024.0  # GB/s → B/us  (1 GB/s = 1024 B/us)
+        return self.bw_gb_per_s * 1000.0  # GB/s → B/us  (1 GB/s = 10⁹ B/s = 1000 B/us)
 
     @classmethod
     def from_csv_row(cls, row: dict[str, str]) -> "MemBandwidth":

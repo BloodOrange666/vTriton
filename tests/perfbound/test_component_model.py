@@ -139,7 +139,7 @@ class TestHarmonicMean:
     def test_mte_bytes_correct(self, calibration, matmul_extract):
         """MTE bytes: (128*32*2 + 32*64*2)*32 + 128*64*2*1 = 409,600 bytes.
 
-        At 180 GB/s = 184,320 B/us: T_mte_gm = 409,600/184,320 = 2.222 us
+        At 180 GB/s = 180,000 B/us: T_mte_gm = 393,216/180,000 = 2.185 us
         """
         result = compute_component_floor(
             matmul_extract,
@@ -149,10 +149,10 @@ class TestHarmonicMean:
             calibration["core"],
         )
         # Total MTE_GM bytes: (8192+4096)*32 = 393,216
-        # T = 393216 / 184320 = 2.133... us
+        # T = 393216 / 180000 = 2.185... us
         assert "mte_gm" in result.per_component_us
-        assert abs(result.per_component_us["mte_gm"] - 2.133) < 0.01, \
-            f"MTE_GM time {result.per_component_us['mte_gm']:.3f} not ~2.133 us"
+        assert abs(result.per_component_us["mte_gm"] - 2.185) < 0.01, \
+            f"MTE_GM time {result.per_component_us['mte_gm']:.3f} not ~2.185 us"
 
     def test_binding_component_is_mte(self, calibration, matmul_extract):
         """MTE_GM should bind — it has the largest per-component time."""
@@ -354,8 +354,63 @@ class TestIntegration:
 
         result = combine(grid, comp, serial, kernel_name="test_matmul")
 
-        # Golden: T_bound = max(0.111, 2.133) + 0 = 2.133 us
-        assert abs(result.t_bound_us - 2.133) < 0.02, \
-            f"T_bound {result.t_bound_us:.3f} not ~2.133 us"
+        # Golden: T_bound = max(0.114, 2.185) + 0 = 2.185 us
+        assert abs(result.t_bound_us - 2.185) < 0.02, \
+            f"T_bound {result.t_bound_us:.3f} not ~2.185 us"
         assert result.binding_tier.value == "component"
         assert result.binding_component == Component.MTE_GM
+
+    def test_attribution_gaps_wired(self, calibration):
+        """Five-way attribution with mis-placed op: Gap 1 > 0, Gap 2/4 = 0.
+
+        An 'add' op assigned to Cube (eligible={Vector}) should produce
+        gap1_wrong_unit_us > 0, while Gap 2 and Gap 4 remain 0 (no
+        small-packet params, no repeat/mask data).
+        """
+        from perfbound.model.component_model import compute_component_floor
+        from perfbound.model.grid_model import GridBound
+        from perfbound.model.serialization import classify_handoffs
+        from perfbound.combine.bound_combiner import combine
+
+        # Extract with a mis-placed op: 'add' on Cube pipe (should be Vector)
+        ops = [
+            OpRecord(op_id=1, op_name="add", component=Component.CUBE,
+                     precision=Precision.FP16, pipe="Cube",
+                     bytes_transferred=0, elements=4096,
+                     duration_cycles=10, loop_multiplier=1, depends_on=[]),
+            OpRecord(op_id=2, op_name="vector_add", component=Component.VECTOR,
+                     precision=Precision.FP16, pipe="Vector",
+                     bytes_transferred=0, elements=4096,
+                     duration_cycles=10, loop_multiplier=1, depends_on=[]),
+        ]
+        extract = HIVMExtract(operations=ops, handoffs=[])
+
+        comp = compute_component_floor(
+            extract, calibration["cube"], calibration["vector"],
+            calibration["memory"], calibration["core"],
+        )
+
+        grid = GridBound(
+            t_grid_floor_us=0.1, total_work=8192, n_cores=20,
+            occupancy=1.0, load_balance=1.0, redundancy=1.0,
+            i_binding=100.0, busiest_core_id=0,
+        )
+        serial = classify_handoffs([], mandatory_handoff_cycles=0, clock_ghz=1.85)
+
+        result = combine(grid, comp, serial, kernel_name="gap_test",
+                         extract=extract)
+
+        # Gap 1: 'add' on Cube (eligible=Vector) → mis-placed
+        assert result.attribution.gap1_wrong_unit_us > 0, \
+            f"Expected Gap 1 > 0, got {result.attribution.gap1_wrong_unit_us:.4f}"
+        # Gap 2: no small-packet params → 0
+        assert result.attribution.gap2_coalescing_us == 0.0
+        # Gap 3: no handoffs → 0
+        assert result.attribution.gap3_avoidable_serial_us == 0.0
+        # Gap 4: no repeat/mask data → 0
+        assert result.attribution.gap4_intra_unit_exec_us == 0.0
+
+        # Dominant gap should be gap1
+        name, frac = result.attribution.dominant_gap()
+        assert name == "gap1_wrong_unit", \
+            f"Expected dominant gap 'gap1_wrong_unit', got '{name}'"
