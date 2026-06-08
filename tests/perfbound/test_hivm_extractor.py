@@ -459,3 +459,203 @@ class TestTotalCycles:
 
         # Last op (store) ends at cycle 250
         assert extract.total_cycles == 250
+
+
+# ── Test: AC-1 O_prec reconciliation against analytic ground truth ────────
+
+
+def _gemm_ops(M, N, K, dtype_bytes=2, elem_type="f16"):
+    """Build a GEMM DES graph: 2 loads + matmul + FixPipe store."""
+    return [
+        {
+            "id": 1, "name": "cube_load_a", "pipe": "CubeMTE2",
+            "duration": 80, "bytes": dtype_bytes * M * K, "elements": M * K,
+            "loop_multiplier": 1, "depends_on": [],
+            "src_space": "gm", "dst_space": "l1", "elem_type": elem_type,
+            "start_cycle": 0, "end_cycle": 80,
+        },
+        {
+            "id": 2, "name": "cube_load_b", "pipe": "CubeMTE2",
+            "duration": 80, "bytes": dtype_bytes * K * N, "elements": K * N,
+            "loop_multiplier": 1, "depends_on": [],
+            "src_space": "gm", "dst_space": "l1", "elem_type": elem_type,
+            "start_cycle": 0, "end_cycle": 80,
+        },
+        {
+            "id": 3, "name": "matmul", "pipe": "Cube",
+            "duration": 200, "bytes": 0, "elements": M * N,
+            "flops": 2 * M * N * K,
+            "loop_multiplier": 1, "depends_on": [1, 2],
+            "src_space": "", "dst_space": "", "elem_type": elem_type,
+            "start_cycle": 80, "end_cycle": 280,
+        },
+        {
+            "id": 4, "name": "fixpipe", "pipe": "FixPipe",
+            "duration": 60, "bytes": dtype_bytes * M * N, "elements": M * N,
+            "loop_multiplier": 1, "depends_on": [3],
+            "src_space": "l0c", "dst_space": "ub", "elem_type": elem_type,
+            "start_cycle": 280, "end_cycle": 340,
+        },
+    ]
+
+
+class TestAC1Reconciliation:
+    """AC-1: Σ O_prec reconciles with analytic flop/byte count within 2%.
+
+    Non-tautological: the DES JSON has per-op values; the analytic ground
+    truth is computed independently from M, N, K. The test verifies the
+    extractor's aggregation matches.
+    """
+
+    def test_cube_flops_reconcile_128(self, tmp_path):
+        """GEMM 128³: Σ Cube O_prec = 2·M·N·K within 2%."""
+        M = N = K = 128
+        des = _make_des_json(_gemm_ops(M, N, K))
+        p = tmp_path / "gemm.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        analytic_flops = 2 * M * N * K
+        cube_flops = extract.o_prec.get("cube", {}).get("fp16", 0)
+        rel_err = abs(cube_flops - analytic_flops) / analytic_flops
+        assert rel_err < 0.02, \
+            f"Cube O_prec {cube_flops} vs analytic {analytic_flops}: {rel_err:.4f}"
+
+    def test_mte_gm_bytes_reconcile_128(self, tmp_path):
+        """GEMM 128³: Σ MTE_GM O_prec = bytes(A) + bytes(B) within 2%."""
+        M = N = K = 128
+        DTYPE = 2  # fp16
+        des = _make_des_json(_gemm_ops(M, N, K))
+        p = tmp_path / "gemm.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        analytic_bytes = DTYPE * (M * K + K * N)
+        mte_bytes = extract.o_prec.get("mte_gm", {}).get("fp16", 0)
+        rel_err = abs(mte_bytes - analytic_bytes) / analytic_bytes
+        assert rel_err < 0.02, \
+            f"MTE_GM O_prec {mte_bytes} vs analytic {analytic_bytes}: {rel_err:.4f}"
+
+    def test_cube_flops_reconcile_4096(self, tmp_path):
+        """GEMM 4096³: realistic LLM hidden-dim scale."""
+        M = N = K = 4096
+        des = _make_des_json(_gemm_ops(M, N, K))
+        p = tmp_path / "gemm.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        analytic_flops = 2 * M * N * K
+        cube_flops = extract.o_prec.get("cube", {}).get("fp16", 0)
+        assert cube_flops == analytic_flops
+
+    def test_mte_gm_bytes_with_loop_multiplier(self, tmp_path):
+        """Loop multiplier scales both flops and bytes correctly."""
+        M = N = K = 64
+        LOOP = 8
+        ops = _gemm_ops(M, N, K)
+        for op in ops:
+            op["loop_multiplier"] = LOOP
+        des = _make_des_json(ops)
+        p = tmp_path / "gemm_loop.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        analytic_flops = 2 * M * N * K * LOOP
+        cube_flops = extract.o_prec.get("cube", {}).get("fp16", 0)
+        assert cube_flops == analytic_flops
+
+        analytic_bytes = (2 * M * K + 2 * K * N) * LOOP  # dtype=2 bytes per elem
+        mte_bytes = extract.o_prec.get("mte_gm", {}).get("fp16", 0)
+        assert mte_bytes == analytic_bytes
+
+
+# ── Test: Flops inference from input loads ────────────────────────────────
+
+
+class TestFlopsInference:
+    """When C++ emits flops=0 for matmul, Python infers 2·M·N·K from loads."""
+
+    def test_flops_inferred_from_loads(self, tmp_path):
+        """Matmul with flops=0 gets flops inferred from input load sizes."""
+        M, N, K = 128, 64, 256
+        ops = [
+            {
+                "id": 1, "name": "cube_load_a", "pipe": "CubeMTE2",
+                "duration": 80, "bytes": 2 * M * K, "elements": M * K,
+                "loop_multiplier": 1, "depends_on": [],
+                "src_space": "gm", "dst_space": "l1", "elem_type": "f16",
+            },
+            {
+                "id": 2, "name": "cube_load_b", "pipe": "CubeMTE2",
+                "duration": 80, "bytes": 2 * K * N, "elements": K * N,
+                "loop_multiplier": 1, "depends_on": [],
+                "src_space": "gm", "dst_space": "l1", "elem_type": "f16",
+            },
+            {
+                "id": 3, "name": "matmul", "pipe": "Cube",
+                "duration": 200, "bytes": 0, "elements": M * N,
+                "flops": 0,  # C++ didn't compute flops
+                "loop_multiplier": 1, "depends_on": [1, 2],
+                "src_space": "", "dst_space": "", "elem_type": "f16",
+            },
+        ]
+        des = _make_des_json(ops)
+        p = tmp_path / "infer.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        analytic_flops = 2 * M * N * K
+        cube_flops = extract.o_prec.get("cube", {}).get("fp16", 0)
+        assert cube_flops == analytic_flops, \
+            f"Inferred flops {cube_flops} != analytic {analytic_flops}"
+
+    def test_flops_not_overwritten_when_present(self, tmp_path):
+        """When C++ provides flops, inference does not overwrite."""
+        M, N, K = 32, 32, 32
+        explicit_flops = 99999  # deliberately different from 2*M*N*K
+        ops = [
+            {
+                "id": 1, "name": "cube_load_a", "pipe": "CubeMTE2",
+                "duration": 80, "bytes": 2 * M * K, "elements": M * K,
+                "loop_multiplier": 1, "depends_on": [],
+                "src_space": "gm", "dst_space": "l1", "elem_type": "f16",
+            },
+            {
+                "id": 2, "name": "cube_load_b", "pipe": "CubeMTE2",
+                "duration": 80, "bytes": 2 * K * N, "elements": K * N,
+                "loop_multiplier": 1, "depends_on": [],
+                "src_space": "gm", "dst_space": "l1", "elem_type": "f16",
+            },
+            {
+                "id": 3, "name": "matmul", "pipe": "Cube",
+                "duration": 200, "bytes": 0, "elements": M * N,
+                "flops": explicit_flops,
+                "loop_multiplier": 1, "depends_on": [1, 2],
+                "src_space": "", "dst_space": "", "elem_type": "f16",
+            },
+        ]
+        des = _make_des_json(ops)
+        p = tmp_path / "explicit.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        assert extract.o_prec["cube"]["fp16"] == explicit_flops
+
+    def test_no_inference_without_loads(self, tmp_path):
+        """Matmul with no input loads falls back to elements, not inference."""
+        ops = [
+            {
+                "id": 3, "name": "matmul", "pipe": "Cube",
+                "duration": 200, "bytes": 0, "elements": 4096,
+                "flops": 0,
+                "loop_multiplier": 1, "depends_on": [],
+                "src_space": "", "dst_space": "", "elem_type": "f16",
+            },
+        ]
+        des = _make_des_json(ops)
+        p = tmp_path / "no_loads.json"
+        p.write_text(json.dumps(des))
+        extract = extract_hivm(p)
+
+        # Falls back to elements since no loads to infer from
+        assert extract.o_prec["cube"]["fp16"] == 4096

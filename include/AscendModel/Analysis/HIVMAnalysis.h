@@ -57,6 +57,7 @@ struct HIVMOp {
   int64_t duration = 0;
   int64_t bytes = 0;
   int64_t elements = 0;
+  int64_t flops = 0;
   int64_t multiBufferSlots = 1;
   int64_t startCycle = 0;
   int64_t endCycle = 0;

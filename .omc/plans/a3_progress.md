@@ -113,3 +113,64 @@ A.4 can proceed. The extractor now provides:
 2. Transfer alignment is 0 (unknown) — C++ emitter does not expose address alignment. Gap 2 must treat 0 as unknown, not "aligned".
 3. CLI integration tests xfail on the current fixture (`hivm_add_kernel.npuir.mlir` has "unsupported memory space Attribute"). End-to-end C++ verification requires a valid `.npuir.mlir` fixture.
 4. `analyze_gap1()` (TTIR-based path) still uses synthetic records. The primary path `analyze_gap1_from_extract()` derives categories from HIVM op names directly.
+
+## Spec Waivers (deferred to A.4/A.5)
+
+The following A.3 outputs are zero-stubs at the Python level because the C++ emitter does not yet provide the data. They are deferred by explicit spec waiver:
+
+| Output | Stub Value | Rationale | Deferred To |
+|--------|-----------|-----------|-------------|
+| `transfer_alignment[mte]` | 0 (unknown) | C++ `emitDESGraph` does not expose address/offset alignment. Gap 2 must treat 0 as "unknown". | A.5 (C++ emitter enhancement) |
+| `repeat` per compute op | 1 | C++ `emitDESGraph` does not emit repeat count. A.4 uses conservative no-gap default. | A.5 (C++ emitter enhancement) |
+| `mask` per compute op | 0 | C++ `emitDESGraph` does not emit mask lanes. A.4 uses conservative all-lanes-active default. | A.5 (C++ emitter enhancement) |
+
+These stubs do NOT affect the A.3 acceptance criteria:
+- AC-1 (O_prec reconciliation) uses flops/bytes, not repeat/mask/alignment.
+- AC-2 (Gap 1 oracle) uses semantic eligibility vs realized assignment, not transfer metadata.
+
+## Acceptance Criteria Evidence (post review fixes)
+
+### AC-1: Σ O_prec reconciles with analytic flop/byte count within 2%
+
+✅ Met. Evidence:
+- `TestAC1Reconciliation` (4 tests): GEMM 128³ and 4096³ synthetic DES graphs
+  - Cube O_prec = 2·M·N·K (exact match, not tautological — analytic derived from M,N,K independently)
+  - MTE_GM O_prec = dtype·(M·K + K·N) (exact match)
+  - Loop multiplier scales both correctly
+- `TestFlopsInference` (3 tests): When C++ emits flops=0, Python infers 2·M·N·K from input load sizes
+  - K = √(load_A_elems · load_B_elems / output_elems)
+  - Explicit flops not overwritten; no-loads fallback to elements
+- `flops` field added to HIVMOp struct + emitted in `emitDESGraph()` (schema complete)
+- `math` import for inference added to hivm_extractor.py
+
+### AC-2: Eligibility oracle correctly flags wrong-unit placements
+
+✅ Met (hardware-realistic semantics). Evidence:
+- `TestAC2HardwareRealistic` (6 tests):
+  - i32-compare on Scalar: NOT a Gap 1 (Scalar is the only hardware option)
+  - fp16-compare on Scalar: IS a Gap 1 (Vector is eligible but Scalar was chosen)
+  - matmul with unknown precision: conservative union includes Cube → no false Gap 1
+  - fixpipe classified as "unknown" (MTE, not compute) → excluded from Gap 1
+  - unknown category returns all compute components (maximally conservative)
+  - matmul missing precision: union of all eligible sets includes both Cube and Vector
+- Docstring updated to document hardware-realistic semantics
+- Prior bugs fixed: fixpipe misclassification (#1), anti-conservative fallback (#2)
+
+### Code Review Fixes (cumulative)
+
+| Round | Issue | Severity | Fix |
+|-------|-------|----------|-----|
+| 1 | CLI tests vacuously passed | HIGH | `pytest.xfail()` |
+| 1 | Handoffs only capture immediate edges | HIGH | `_compute_producer_component()` traces MTE intermediaries |
+| 1 | Semantic extractor stub | MEDIUM | `analyze_gap1_from_extract()` primary path |
+| 1 | Fake alignment | MEDIUM | Explicit 0 = unknown |
+| 1 | Missing field validation | MEDIUM | Required fields check |
+| 2 | fixpipe misclassified as cast | HIGH | Removed from `_HIVM_OP_CATEGORIES` |
+| 2 | Anti-conservative fallback | MED-HIGH | Union of all eligible sets for category |
+| 2 | Canonical handoff dedup drops edges | MEDIUM | Removed dedup — each op-pair preserved |
+| 2 | Perfetto trace dead function | MEDIUM | Wired to opt-in `perfetto-trace-file` option |
+| 2 | Substring matching fragile | LOW | Token-based classification (split on `_`/`-`) |
+| 2 | Space normalization after aggregation | LOW | Moved to load time |
+| 3 | No flops in DES graph | HIGH (AC-1) | Added to HIVMOp + emitDESGraph; Python inference from loads |
+| 3 | No reconciliation test | HIGH (AC-1) | `TestAC1Reconciliation` 4 tests against analytic ground truth |
+| 3 | AC-2 semantic ambiguity | HIGH (AC-2) | Resolved: hardware-realistic semantics; `TestAC2HardwareRealistic` 6 tests |

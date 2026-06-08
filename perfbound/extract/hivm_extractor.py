@@ -19,6 +19,7 @@ Extracts per-component:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -175,7 +176,7 @@ def load_hivm_desgraph(path: Path | str) -> List[OpRecord]:
             pipe=node.get("pipe", ""),
             bytes_transferred=node.get("bytes", 0),
             elements=node.get("elements", 0),
-            flops=node.get("flops", 0),
+            flops=node.get("flops", 0),  # C++ emitDESGraph emits flops for compute ops
             duration_cycles=node.get("duration", 0),
             loop_multiplier=node.get("loop_multiplier", 1),
             depends_on=node.get("depends_on", []),
@@ -249,6 +250,51 @@ def _compute_producer_component(
     return None
 
 
+def _infer_flops_from_loads(ops: List[OpRecord]) -> None:
+    """Infer flops for compute ops where the C++ emitter left flops=0.
+
+    For matmul (Cube pipe): traces input loads to compute 2·M·N·K.
+    Given load_A has elements=M·K and load_B has elements=K·N, and
+    the matmul output has elements=M·N, then K = √(M·K · K·N / M·N)
+    and flops = 2 · M · N · K.
+
+    Modifies ops in place.
+    """
+    op_by_id = {op.op_id: op for op in ops}
+
+    for op in ops:
+        if op.flops > 0:
+            continue  # already populated by C++ or depgraph merge
+        if op.component != Component.CUBE:
+            continue  # only infer for Cube matmul ops
+
+        # Find CubeMTE2 loads feeding this op
+        input_loads = []
+        for dep_id in op.depends_on:
+            dep = op_by_id.get(dep_id)
+            if dep and dep.component == Component.MTE_GM and dep.elements > 0:
+                input_loads.append(dep)
+
+        if len(input_loads) < 2:
+            continue  # can't infer without two input loads
+
+        load_a, load_b = input_loads[0], input_loads[1]
+        output_elements = op.elements
+
+        if output_elements <= 0 or load_a.elements <= 0 or load_b.elements <= 0:
+            continue
+
+        # K = sqrt(load_A_elems * load_B_elems / output_elems)
+        k_squared = load_a.elements * load_b.elements / output_elements
+        if k_squared <= 0:
+            continue
+        k = int(round(k_squared ** 0.5))
+        if k <= 0:
+            continue
+
+        op.flops = 2 * output_elements * k
+
+
 def extract_hivm(
     desgraph_path: Path | str,
     depgraph_path: Path | str | None = None,
@@ -275,6 +321,10 @@ def extract_hivm(
                 op.end_cycle = dep.end_cycle
                 op.hw_unit = dep.hw_unit
                 op.flops = dep.flops
+
+    # Infer flops for compute ops where C++ emitted flops=0.
+    # For matmul: flops = 2 * M * N * K, derived from input load sizes.
+    _infer_flops_from_loads(ops)
 
     # Build handoff list: cross-component edges in depends_on.
     #

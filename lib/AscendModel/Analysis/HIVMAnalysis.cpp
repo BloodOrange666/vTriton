@@ -3156,6 +3156,7 @@ void HIVMAnalysisReport::emitDESGraph(llvm::raw_ostream &os,
        << ",\"core_type\":\"" << op.coreType << "\""
        << ",\"bytes\":" << op.bytes
        << ",\"elements\":" << op.elements
+       << ",\"flops\":" << op.flops
        << ",\"loop_multiplier\":" << op.loopMultiplier
        << ",\"multi_buffer_slots\":" << op.multiBufferSlots
        << ",\"read_buffers\":" << joinStrVec(op.readBuffers)

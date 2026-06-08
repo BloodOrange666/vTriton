@@ -4,13 +4,18 @@ M3 — Eligibility Oracle.
 Determines which hardware units each op *could* run on based on TTIR/Linalg
 semantics, independent of what HIVM actually assigned. This is the Gap 1 input:
 
-    Gap 1 = eligibility(op) - realized_assignment(op)
+    Gap 1 = realized_assignment(op) ∉ eligibility(op)
 
 Rules:
   - matmul + (FP16|INT8) → {Cube}
   - element-wise / reduction → {Vector}
   - type-incompatible (e.g., i32 compare) → {Scalar}
   - MTE ops are unit-specific (no placement choice)
+
+Hardware-realistic semantics:
+  Eligibility reflects what the hardware *can* do, not what would be ideal.
+  i32-compare on Scalar is NOT a Gap 1 — Scalar is the only hardware option.
+  The seeded Gap 1 case is fp16-compare forced to Scalar (compiler bug).
 
 Conservative: if uncertain, include MORE eligible units (fewer false Gap 1s).
 """
