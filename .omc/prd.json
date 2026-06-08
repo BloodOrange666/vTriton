@@ -1,0 +1,188 @@
+{
+  "title": "A.2 — DSL Extractor: C++ MLIR Pass for TTIR Extraction + Bug Fixes",
+  "description": "Replace fragile regex-based TTIR parsing with a robust C++ MLIR pass that walks the IR AST and emits structured JSON. Fix 3 bugs in grid_idioms.py and dsl_extractor.py. Implement comprehensive test suite with 10 reference kernel cases.",
+  "stories": [
+    {
+      "id": "US-A2-001",
+      "title": "Fix Bug 1 in grid_idioms.py: wrong parents depth",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "grid_idioms.py line 46: parents[3] changed to parents[2]",
+        "Comment updated to reflect correct path depth",
+        "Config loading test verifies get_capacities() loads from configs/ascend_910b3.json",
+        "pytest test_grid_idioms.py::test_config_loading passes"
+      ]
+    },
+    {
+      "id": "US-A2-002",
+      "title": "Create C++ ExtractTTIRInfoPass that emits JSON",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "ExtractTTIRInfo.cpp created in lib/AscendModel/Transforms/",
+        "Pass walks TTIR using MLIR AST API (no regex/text parsing)",
+        "Extracts grid_axes from triton::GetProgramIdOp operations",
+        "Extracts persistent_loops from scf::ForOp with lb=program_id",
+        "Extracts tensor_ptr_shapes from triton::MakeTensorPtrOp result types",
+        "Detects has_dot from presence of triton::DotOp",
+        "Emits JSON to stdout via llvm::outs()",
+        "Passes.td updated with ExtractTTIRInfoPass definition",
+        "CMakeLists.txt updated to include ExtractTTIRInfo.cpp",
+        "PassRegistration.cpp updated to register the pass"
+      ]
+    },
+    {
+      "id": "US-A2-003",
+      "title": "Build and verify C++ pass on flash_attention.ttir",
+      "priority": 3,
+      "passes": true,
+      "acceptanceCriteria": [
+        "tritonsim-opt builds successfully with ExtractTTIRInfoPass",
+        "Two-stage pipeline works: triton-opt | tritonsim-opt --extract-ttir-info",
+        "JSON output contains grid_axes: [0] for flash_attention.ttir",
+        "JSON output contains persistent_loops[0] with lb_is_pid=true, ub=4, step=20",
+        "JSON output contains tensor_ptr_shapes[0] = [32, 128] (tile size, not matrix bounds)",
+        "JSON output contains has_dot: true",
+        "Direct subprocess invocation from Python succeeds and parses JSON"
+      ]
+    },
+    {
+      "id": "US-A2-004",
+      "title": "Create Python mlir_parser.py wrapper",
+      "priority": 4,
+      "passes": true,
+      "acceptanceCriteria": [
+        "perfbound/extract/mlir_parser.py created",
+        "parse_ttir() function wraps C++ pass via subprocess",
+        "Two-stage pipeline: triton-opt --mlir-print-op-generic | tritonsim-opt --extract-ttir-info",
+        "Returns dict with keys: grid_axes, persistent_loops, tensor_ptr_shapes, has_dot",
+        "Handles subprocess errors gracefully",
+        "Test verifies parse_ttir('test/flash_attention.ttir') returns expected dict"
+      ]
+    },
+    {
+      "id": "US-A2-005",
+      "title": "Refactor dsl_extractor.py to use mlir_parser",
+      "priority": 5,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Remove _parse_constants(), _parse_get_program_id(), _parse_persistent_loop(), _parse_tile_shapes()",
+        "Extract_from_ttir() rewritten to use parse_ttir() from mlir_parser",
+        "No regex functions remain in dsl_extractor.py (re.search, re.finditer, re.match)",
+        "Dispatch logic (persistent vs 1D vs 2D) preserved in structure",
+        "Uses structured info dict instead of regex results"
+      ]
+    },
+    {
+      "id": "US-A2-006",
+      "title": "Fix Bug 3: Persistent kernel path uses correct work model",
+      "priority": 6,
+      "passes": true,
+      "acceptanceCriteria": [
+        "is_persistent branch in _extract_from_ttir() replaced with direct GridInfo construction",
+        "Uses round-robin tile assignment: program p gets tiles p, p+stride, p+2*stride, ...",
+        "Derives block_m from tensor_ptr_shapes[0][0] (32 for flash_attention)",
+        "Derives total_tiles from problem_shape (ceil(M/block_m))",
+        "n_programs = stride (20 for flash_attention)",
+        "occupancy = active_programs / n_programs (4/20 = 0.2 for flash_attention)",
+        "load_balance = mean(work) / max(work) (1.0 for flash_attention)",
+        "work dict has 20 entries: work[0]=1, work[4]=0 for flash_attention"
+      ]
+    },
+    {
+      "id": "US-A2-007",
+      "title": "Create test_mlir_parser.py with C++ pass output tests",
+      "priority": 7,
+      "passes": true,
+      "acceptanceCriteria": [
+        "tests/perfbound/test_mlir_parser.py created",
+        "test_parse_grid_axes verifies grid_axes == [0] for flash_attention.ttir",
+        "test_parse_persistent_loop verifies lb_is_pid=true, ub=4, step=20",
+        "test_parse_tensor_ptr_shapes_first verifies [32, 128] (tile size)",
+        "test_parse_has_dot verifies has_dot == true",
+        "Tests skip gracefully if build/bin/tritonsim-opt not found",
+        "All 5 tests pass"
+      ]
+    },
+    {
+      "id": "US-A2-008",
+      "title": "Create test_dsl_extractor.py with 10-kernel parametrized suite",
+      "priority": 8,
+      "passes": true,
+      "acceptanceCriteria": [
+        "tests/perfbound/test_dsl_extractor.py created",
+        "REFERENCE_KERNELS list with 10 cases (K1-K10) from plan",
+        "Parametrized test @pytest.mark.parametrize runs all 10 cases",
+        "K1 (1D exact): occ=0.2, lb=1.0, tile_assignment[0]=(0,)",
+        "K2 (1D remainder): occ=0.2, lb=0.781, work[3]=4",
+        "K3 (2D exact): occ=0.8, lb=1.0, work[0]=2048",
+        "K4 (Persistent flash_attn): occ=0.2, lb=1.0, work[0]=1, work[4]=0",
+        "K5 (Persistent 21/20): occ=1.0, lb=0.525, work[0]=2, work[1]=1",
+        "K6 (2D uneven): occ=0.4, lb=0.610, work[0]=2048, work[7]=144",
+        "K7 (UB violation): buffer_pressure_ok=False",
+        "K8 (G > n_cores): occ=1.0, lb=1.0",
+        "K9 (1D over-subscribed): occ=1.0, lb=1.0",
+        "K10 (Persistent 1/20): occ=0.05, lb=1.0, work[0]=1, work[1]=0",
+        "test_extract_persistent_flash_attn end-to-end on flash_attention.ttir",
+        "Integration test verifies compute_grid_floor() returns t_grid_floor_us > 0"
+      ]
+    },
+    {
+      "id": "US-A2-009",
+      "title": "Create test grid_idioms.py with idiom function tests",
+      "priority": 9,
+      "passes": true,
+      "acceptanceCriteria": [
+        "tests/perfbound/test_grid_idioms.py created",
+        "test_1d_exact: M=128, BM=32 → G=4, work[p]=32, load_balance=1.0",
+        "test_1d_remainder: M=100, BM=32 → G=4, work[3]=4",
+        "test_2d_tile_grid: M=128, N=256, BM=32, BN=64 → G=16, work[0]=2048",
+        "test_ub_violation: BM=512*1024 → buffer_pressure_ok=False",
+        "test_config_loading: temp JSON with ub.size_kb=192 → get_capacities()['ub']==192*1024",
+        "All 5 tests pass"
+      ]
+    },
+    {
+      "id": "US-A2-010",
+      "title": "Create fixture TTIR files for K4, K5, K10 test cases",
+      "priority": 10,
+      "passes": true,
+      "acceptanceCriteria": [
+        "test/persistent_21.ttir created: scf.for with ub=21, step=20, make_tensor_ptr with <tensor<32xf32>>",
+        "test/persistent_1.ttir created: scf.for with ub=1, step=20, make_tensor_ptr with <tensor<32xf32>>",
+        "Both files are valid minimal TTIR (can be parsed by triton-opt)",
+        "Files contain only structural ops needed for extraction (tt.get_program_id, scf.for, tt.make_tensor_ptr)"
+      ]
+    },
+    {
+      "id": "US-A2-011",
+      "title": "Verify AC-1 through AC-7 acceptance criteria",
+      "priority": 11,
+      "passes": true,
+      "acceptanceCriteria": [
+        "AC-1: parse_ttir('test/flash_attention.ttir')['tensor_ptr_shapes'][0] == [32, 128]",
+        "AC-2: extract_grid_info(...).occupancy == 0.2, load_balance == 1.0 for flash_attention",
+        "AC-3: len(grid.work) == 20, work[0]==1, work[4]==0",
+        "AC-4: get_capacities(192kb_json, force_reload=True)['ub'] == 192*1024",
+        "AC-5: All 10 reference kernel cases pass",
+        "AC-6: pytest tests/ -q passes (tritonsim-opt tests skipped if not built)",
+        "AC-7: No re.finditer/re.search/re.match in perfbound/extract/"
+      ]
+    },
+    {
+      "id": "US-A2-012",
+      "title": "Document A.2 completion in a2_progress.md",
+      "priority": 12,
+      "passes": true,
+      "acceptanceCriteria": [
+        ".omc/plans/a2_progress.md created following a0_progress.md template",
+        "Documents all 3 bugs fixed with file locations and line numbers",
+        "Lists C++ ExtractTTIRInfoPass implementation details",
+        "Lists Python mlir_parser.py wrapper details",
+        "Documents all 10 reference kernel cases with expected values",
+        "Confirms ready for A.3 stage (Component Model Implementation)"
+      ]
+    }
+  ]
+}

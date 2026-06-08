@@ -17,9 +17,11 @@ via the calibration system. Default values are provided for compatibility.
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 
 # Default capacity limits (910B3 values from ascend_910b3.json)
@@ -43,7 +45,7 @@ def _load_capacity_from_config(config_path: Optional[str] = None) -> Dict[str, i
     """
     if config_path is None:
         # Try to find ascend_910b3.json relative to project root
-        project_root = Path(__file__).parents[3]  # perfbound/extract/ → vTriton/
+        project_root = Path(__file__).parents[2]  # perfbound/extract/ → perfbound/ → vTriton/
         config_path = project_root / "configs" / "ascend_910b3.json"
 
     config_file = Path(config_path)
@@ -56,7 +58,6 @@ def _load_capacity_from_config(config_path: Optional[str] = None) -> Dict[str, i
             "l0c": DEFAULT_L0C_CAPACITY_BYTES,
         }
 
-    import json
     with open(config_file) as f:
         config = json.load(f)
 
@@ -121,7 +122,6 @@ def idiom_1d_row_block(
     Returns:
         TileIdiomResult with tile assignment and validity checks.
     """
-    import math
     caps = get_capacities()
     if ub_limit_bytes is None:
         ub_limit_bytes = caps["ub"]
@@ -170,7 +170,6 @@ def idiom_2d_tile_grid(
     Returns:
         TileIdiomResult with tile assignment and validity checks.
     """
-    import math
     caps = get_capacities()
     if ub_limit_bytes is None:
         ub_limit_bytes = caps["ub"]

@@ -1,0 +1,15 @@
+module {
+  tt.func public @persistent_1(%arg0: !tt.ptr<f32>) {
+    %c1_i32 = arith.constant 1 : i32
+    %c20_i32 = arith.constant 20 : i32
+    %c32_i64 = arith.constant 32 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c0_i32 = arith.constant 0 : i32
+
+    %0 = tt.get_program_id x : i32
+    scf.for %arg1 = %0 to %c1_i32 step %c20_i32 : i32 {
+      %1 = tt.make_tensor_ptr %arg0, [%c32_i64, %c1_i64], [%c32_i64, %c1_i64], [%c0_i32, %c0_i32] {order = array<i32: 0, 1>} : <tensor<32xf32>>
+    }
+    tt.return
+  }
+}

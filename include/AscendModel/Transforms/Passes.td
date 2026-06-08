@@ -173,6 +173,32 @@ def HIVMAnalysisPass : Pass<"analyze-hivm", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// ExtractTTIRInfo
+//===----------------------------------------------------------------------===//
+
+def ExtractTTIRInfoPass : Pass<"extract-ttir-info", "ModuleOp"> {
+  let summary = "Extract TTIR structural info as JSON (grid axes, loop bounds, tile shapes)";
+  let description = [{
+    Walks the TTIR module and emits a JSON object to stdout containing:
+    - grid_axes: program_id axis indices (0=x, 1=y, 2=z)
+    - persistent_loops: scf.for loops where lb = program_id, with ub and step constants
+    - tensor_ptr_shapes: shapes of tt.make_tensor_ptr result tensor types
+    - has_dot: true if any tt.dot op is present (indicates Cube kernel)
+
+    Usage:
+      triton-opt input.ttir --allow-unregistered-dialect --mlir-print-op-generic | \\
+      tritonsim-opt - --allow-unregistered-dialect --extract-ttir-info
+
+    Example output includes fields grid_axes (array), persistent_loops (array),
+    tensor_ptr_shapes (array), and has_dot (boolean).
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // PerfReport
 //===----------------------------------------------------------------------===//
 def PerfReportPass : Pass<"perf-report", "ModuleOp"> {
