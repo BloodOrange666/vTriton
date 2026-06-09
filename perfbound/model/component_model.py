@@ -112,6 +112,17 @@ def _get_mte_throughput_bytes_per_us(
         return 0.0
 
 
+def _get_scalar_throughput_ops_per_us(prec: Precision, vector: VectorConfig) -> float:
+    """Rough Scalar throughput in operations per microsecond.
+
+    Delegates to VectorConfig.get_scalar_throughput_ops_per_us.
+    Scalar is ~10-50× slower than Vector; we use a conservative 20× slower
+    than Vector FP16 for two-limit Gap-1 analysis.
+    """
+    prec_str = prec.value if prec else ""
+    return vector.get_scalar_throughput_ops_per_us(prec_str)
+
+
 # ── Core computation ───────────────────────────────────────────────────────
 
 @dataclass
@@ -275,12 +286,24 @@ def compute_component_floor(
             total_ops[comp_str] = total_work
 
         elif comp == Component.SCALAR:
-            # Scalar: no separate throughput — apply overhead factor later
-            # For now, scalar time = 0 (accounted for by scalar_overhead_factor
-            # in kernel-level cycle computation in PipelineAnalysis)
+            # Scalar: rough throughput for two-limit Gap-1 analysis.
+            # Without real Scalar calibration, use Vector/20 as a conservative proxy.
+            # This makes two-limit non-vacuous: Scalar→Vector idealization can now
+            # show positive compiler_headroom.
             total_ops[comp_str] = total_work
-            t_c = 0.0  # scalar cycles folded into overhead factor
-            i_c = float("inf") if total_work > 0 else 0.0
+            if total_work > 0:
+                # Use the best-available Scalar rate (first precision with work)
+                scalar_rate = 0.0
+                for prec, w in precision_work:
+                    if prec is not None and w > 0:
+                        rate = _get_scalar_throughput_ops_per_us(prec, vector)
+                        if rate > scalar_rate:
+                            scalar_rate = rate
+                i_c = scalar_rate
+                t_c = total_work / i_c if i_c > 0 else 0.0
+            else:
+                i_c = 0.0
+                t_c = 0.0
 
         elif comp in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
             # MTE: single BW per path, harmonic reduces to that BW

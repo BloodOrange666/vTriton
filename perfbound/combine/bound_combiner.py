@@ -1,14 +1,20 @@
 # M5 — Bound Combiner (two-tier max + T_serial_irreducible)
 #
-# T_bound = max(T_grid_floor, T_core_floor) + T_serial_irreducible
+# T_bound = max(T_grid_floor, T_core_floor + T_serial_irreducible)
 #
 # Composition is max (two independent lower bounds on the same wall-clock
-# time), with + T_serial_irreducible attaching to the Tier-2 term.
+# time).  T_serial_irreducible attaches to the Tier-2 term because
+# serialization is intra-core (Cube↔Vector on the same core).
 #
-# The max reflects the insight that the grid-level and component-level
-# floors are independent lower bounds — whichever is higher constrains
-# the overall time.  T_serial_irreducible is added because it is NOT
-# captured by either tier's ideal overlap assumption.
+# **SPEC DIVERGENCE (intentional):** The spec (performance_bound_model.md §4.1,
+# §7) literally writes max(T_grid_floor, T_core_floor) + T_serial_irreducible.
+# This additive form is UNSOUND: max(a,b)+c ≥ max(a, b+c) for c≥0, which can
+# overstate a lower bound and risk T_bound > T_measured (violating the
+# conservatism theorem T_bound ≤ T_measured from spec §4.0).
+#
+# The implemented form (max(grid, core+serial)) is the tightest provable lower
+# bound and matches the spec's own prose (§4.0: "+T_serial attaches to the
+# Tier-2 term"). Recommendation: Update spec §4.1/§7 formulas to match this.
 #
 # Five-way attribution decomposes the gap between T_bound and a hypothetical
 # zero-overhead kernel.  This is diagnostic output, NOT part of the bound.
@@ -115,7 +121,11 @@ def combine(
 ) -> BoundResult:
     """Combine Tier 1 + Tier 2 + serialization into a single conservative bound.
 
-    T_bound = max(T_grid_floor, T_core_floor) + T_serial_irreducible
+    T_bound = max(T_grid_floor, T_core_floor + T_serial_irreducible)
+
+    NOTE: This deliberately differs from the spec's written formula
+    max(T_grid_floor, T_core_floor) + T_serial_irreducible, which is
+    unsound (can overstate the bound). See module header for details.
 
     The binding tier is determined by which floor is higher:
     - Grid binds when occupancy/load_balance constrain more than per-component BW
@@ -139,14 +149,12 @@ def combine(
     Returns:
         BoundResult with T_bound, binding tier/component, and attribution.
     """
-    # Compute the max of the two independent floors
-    max_floor_us = max(grid.t_grid_floor_us, component.t_core_floor_us)
+    # Sound composition: serialization is intra-core, attaches to Tier-2 term
+    core_plus_serial_us = component.t_core_floor_us + serial.t_serial_irreducible_us
+    t_bound_us = max(grid.t_grid_floor_us, core_plus_serial_us)
 
-    # T_bound = max(floors) + mandatory serialization
-    t_bound_us = max_floor_us + serial.t_serial_irreducible_us
-
-    # Determine binding tier
-    if grid.t_grid_floor_us >= component.t_core_floor_us:
+    # Determine binding tier: grid binds iff grid floor ≥ core+serial floor
+    if grid.t_grid_floor_us >= core_plus_serial_us:
         binding_tier = BindingTier.GRID
         binding_component = None  # grid binds, not a specific component
     else:
@@ -156,7 +164,14 @@ def combine(
     # Attribution: initialize from available data
     attribution = Attribution()
 
-    # Gap 3 (avoidable serial): directly from serialization split
+    # Grid gap: realized floor minus ideal-grid floor
+    # grid_gap_us = T_grid_floor × (1 − occupancy · load_balance)
+    # Perfect grid (occ=lb=1) → 0; imperfect → positive gap
+    occ = grid.occupancy
+    lb = grid.load_balance
+    attribution.grid_gap_us = grid.t_grid_floor_us * (1.0 - occ * lb)
+
+    # Gap 3 (avoidable serial): from serialization split (deduped)
     attribution.gap3_avoidable_serial_us = serial.t_serial_avoidable_us
 
     # Gap 1/2/4 from extract data
@@ -190,6 +205,7 @@ def bound_from_extract(
     n_cores: int = 20,
     occupancy: float = 1.0,
     load_balance: float = 1.0,
+    total_programs: int | None = None,
 ) -> BoundResult:
     """High-level entry point: compute T_bound from an HIVM extract + calibration.
 
@@ -205,6 +221,7 @@ def bound_from_extract(
         n_cores: Number of cores assigned to this kernel.
         occupancy: Grid occupancy fraction (0, 1].
         load_balance: Load balance fraction (0, 1].
+        total_programs: Total program instances.  Defaults to 1 (single program).
 
     Returns:
         BoundResult with T_bound and decomposed floors.
@@ -222,9 +239,13 @@ def bound_from_extract(
     if calib_db is not None:
         # Route through compute_bounds: picks i_binding and total_work
         # consistently (memory-bound or compute-bound) from the binding component.
+        # Wave scaling: pass total_programs and n_cores for correct multi-wave bounds.
+        # Default total_programs=1 (single program) preserves pre-A.5 behavior
+        # for callers that don't specify a real launch grid.
+        _total_programs = total_programs if total_programs is not None else 1
         grid_info = GridInfo(
             grid_dims=(n_cores,),
-            total_programs=n_cores,
+            total_programs=_total_programs,
             tile_assignment={},
             work={},
             occupancy=occupancy,
@@ -232,7 +253,8 @@ def bound_from_extract(
             redundancy=1.0,
             busiest_core_id=0,
         )
-        pieces = compute_bounds(grid_info, extract, calib_db)
+        pieces = compute_bounds(grid_info, extract, calib_db,
+                                n_cores=n_cores, total_programs=_total_programs)
         grid = pieces.grid
         comp = pieces.component
         serial = pieces.serial
@@ -309,11 +331,15 @@ def _compute_gap1(
     gap1_us = 0.0
 
     for op in extract.operations:
-        # MTE and Scalar have fixed assignment — no placement choice
+        # MTE has fixed assignment — no placement choice
         if op.component in (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB):
             continue
-        if op.component == Component.SCALAR:
-            continue  # scalar ops are always on the scalar pipe
+        # NOTE: Do NOT skip Scalar ops here.  A Scalar op whose semantic-
+        # eligibility set includes Vector/Cube (e.g. the seeded i32-compare
+        # forced to Scalar by the compiler) IS the canonical Gap-1
+        # mis-placement (spec §3 Gap 1; implementation_and_paper_plan.md:126).
+        # The eligibility oracle correctly returns {Scalar} for true
+        # Scalar-only ops (i32 compare), so those won't trigger a false Gap 1.
 
         category = _op_category(op.op_name)
         prec_str = op.precision.value if op.precision else None

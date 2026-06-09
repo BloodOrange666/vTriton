@@ -408,6 +408,8 @@ static int64_t getTypeByteWidth(mlir::Type type) {
 /// Get the human-readable element type name from an MLIR type.
 /// Returns "" if the type cannot be classified.
 static std::string getElementTypeName(mlir::Type type) {
+  if (!type)
+    return "";
   auto shaped = llvm::dyn_cast<mlir::ShapedType>(type);
   mlir::Type elemTy = shaped ? shaped.getElementType() : type;
   if (!elemTy)
@@ -428,6 +430,8 @@ static std::string getElementTypeName(mlir::Type type) {
 }
 
 static int64_t getShapedTypeElementCount(mlir::Type type) {
+  if (!type)
+    return 0;
   auto shaped = llvm::dyn_cast<mlir::ShapedType>(type);
   if (!shaped || !shaped.hasStaticShape())
     return 0;
@@ -438,6 +442,8 @@ static int64_t getShapedTypeElementCount(mlir::Type type) {
 }
 
 static int64_t getShapedTypeBytes(mlir::Type type) {
+  if (!type)
+    return 0;
   auto shaped = llvm::dyn_cast<mlir::ShapedType>(type);
   if (!shaped)
     return 0;
@@ -616,6 +622,22 @@ static std::string stringifyTypedCore(std::optional<mlir::hivm::TCoreType> core)
   return mlir::hivm::stringifyTCoreType(*core).str();
 }
 
+static std::string stringifyTypedEvent(std::optional<mlir::hivm::EventAttr> staticId,
+                                       mlir::Value dynamicId) {
+  if (staticId)
+    return mlir::hivm::stringifyEVENT(staticId->getEvent()).str();
+  (void)dynamicId;
+  return "";
+}
+
+static std::string stringifyTypedFlag(std::optional<mlir::IntegerAttr> staticId,
+                                      mlir::Value dynamicId) {
+  if (staticId)
+    return std::to_string(staticId->getInt());
+  (void)dynamicId;
+  return "";
+}
+
 static std::string canonicalizeStaticEventToken(llvm::StringRef token) {
   if (token.consume_front("EVENT_ID"))
     return token.str();
@@ -636,11 +658,17 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
       parsed.op.pipe = convertTypedPipe(pipeIface.getOutPipe());
     }
   }
-  if (auto coreIface = llvm::dyn_cast<mlir::hivm::CoreTypeInterface>(op))
-    parsed.op.coreType = stringifyTypedCore(coreIface.getCoreType());
+  if (auto coreIface = llvm::dyn_cast<mlir::hivm::CoreTypeInterface>(op)) {
+    auto ct = coreIface.getCoreType();
+    if (ct)
+      parsed.op.coreType = stringifyTypedCore(ct);
+  }
   if (parsed.op.coreType.empty()) {
-    if (auto inferIface = llvm::dyn_cast<mlir::hivm::InferCoreTypeInterface>(op))
-      parsed.op.coreType = stringifyTypedCore(inferIface.inferCoreType());
+    if (auto inferIface = llvm::dyn_cast<mlir::hivm::InferCoreTypeInterface>(op)) {
+      auto inferred = inferIface.inferCoreType();
+      if (inferred)
+        parsed.op.coreType = stringifyTypedCore(inferred);
+    }
   }
   // Resolve "CUBE_OR_VECTOR" to a concrete core type using the enclosing
   // function name.  This is critical for disambiguating PIPE_MTE2 into
@@ -648,14 +676,14 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
   parsed.op.coreType =
       resolveCoreTypeFromFunc(op, parsed.op.coreType).str();
 
-  if (llvm::isa<mlir::hivm::LoadOp>(op))
+  if (llvm::isa<mlir::hivm::LoadOp>(op) && op->getNumOperands() > 0) {
     parsed.op.pipe = selectMTE2PipeForSpaces(
         getCanonicalTypeAddressSpace(op->getOperand(0).getType()),
         op->getNumOperands() > 1
             ? getCanonicalTypeAddressSpace(op->getOperand(1).getType())
             : llvm::StringRef(),
         parsed.op.coreType);
-  else if (llvm::isa<mlir::hivm::StoreOp>(op))
+  } else if (llvm::isa<mlir::hivm::StoreOp>(op))
     parsed.op.pipe = HIVMPipe::MTE3;
   else if (llvm::isa<mlir::hivm::FixpipeOp>(op))
     parsed.op.pipe = HIVMPipe::FixPipe;
@@ -686,6 +714,7 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
     parsed.op.opName = "pipe_barrier";
     parsed.op.isSyncOp = true;
     parsed.op.isBarrier = true;
+    if (!barrier.getPipe()) return true;
     HIVMPipe rawPipe = convertTypedPipe(barrier.getPipe().getPipe());
     parsed.op.pipe = disambiguateMTE2Pipe(rawPipe, HIVMPipe::Unknown,
                                           parsed.op.coreType);
@@ -695,6 +724,7 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
   if (auto setFlag = llvm::dyn_cast<mlir::hivm::SetFlagOp>(op)) {
     parsed.op.opName = "set_flag";
     parsed.op.isSyncOp = true;
+    if (!setFlag.getSetPipe() || !setFlag.getWaitPipe()) return true;
     parsed.senderEvent = stringifyTypedPipe(setFlag.getSetPipe().getPipe());
     parsed.receiverEvent = stringifyTypedPipe(setFlag.getWaitPipe().getPipe());
     parsed.eventId =
@@ -712,6 +742,7 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
   if (auto waitFlag = llvm::dyn_cast<mlir::hivm::WaitFlagOp>(op)) {
     parsed.op.opName = "wait_flag";
     parsed.op.isSyncOp = true;
+    if (!waitFlag.getSetPipe() || !waitFlag.getWaitPipe()) return true;
     parsed.senderEvent = stringifyTypedPipe(waitFlag.getSetPipe().getPipe());
     parsed.receiverEvent = stringifyTypedPipe(waitFlag.getWaitPipe().getPipe());
     parsed.eventId = stringifyTypedEvent(waitFlag.getStaticEventId(),
@@ -729,6 +760,8 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
   if (auto syncSet = llvm::dyn_cast<mlir::hivm::SyncBlockSetOp>(op)) {
     parsed.op.opName = "sync_block_set";
     parsed.op.isSyncOp = true;
+    if (!syncSet.getTcoreType() || !syncSet.getTpipe() || !syncSet.getPipe())
+      return true;
     parsed.syncCoreType =
         mlir::hivm::stringifyTCoreType(syncSet.getTcoreType().getTcoretype()).str();
     parsed.op.coreType = parsed.syncCoreType;
@@ -750,6 +783,8 @@ static bool populateTypedHivmOp(mlir::Operation *op, ParsedOp &parsed) {
     parsed.op.opName = "sync_block_wait";
     parsed.op.isSyncOp = true;
     parsed.op.isBarrier = true;
+    if (!syncWait.getTcoreType() || !syncWait.getTpipe() || !syncWait.getPipe())
+      return true;
     parsed.syncCoreType =
         mlir::hivm::stringifyTCoreType(syncWait.getTcoreType().getTcoretype()).str();
     parsed.op.coreType = parsed.syncCoreType;

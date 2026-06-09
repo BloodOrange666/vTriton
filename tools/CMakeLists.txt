@@ -65,6 +65,17 @@ target_link_libraries(tritonsim-hivm
   LLVMSupport
 )
 
+if(TRITONSIM_HAS_BISHENGIR_HIVM)
+  target_link_libraries(tritonsim-hivm
+    PRIVATE
+    ${TRITONSIM_BISHENGIR_HIVM_LIBS}
+  )
+  target_include_directories(tritonsim-hivm
+    PRIVATE
+    ${TRITONSIM_BISHENGIR_INCLUDE_DIRS}
+  )
+endif()
+
 mlir_check_all_link_libraries(tritonsim-hivm)
 
 #===----------------------------------------------------------------------===//

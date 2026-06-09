@@ -310,12 +310,18 @@ because mandatory serialization is intra-core.
 
 ```
     T_bound = max(
-        T_grid_floor,              ← Tier 1: busiest core's share / chip
-        T_core_floor               ← Tier 2: busiest core's component floor
-    ) + T_serial_irreducible       ← mandatory intra-core serialization
+        T_grid_floor,                          ← Tier 1: busiest core's share / chip
+        T_core_floor + T_serial_irreducible    ← Tier 2: component floor + intra-core serialization
+    )
 
     with work_busiest_core set by occupancy × load_balance (× redundancy,
     see §4.3) from Tier 1, and I_c the per-core ideal performances (Tier 2).
+
+    NOTE (A.5 soundness fix): T_serial_irreducible attaches to the Tier-2
+    term inside the max, not outside it. The additive form max(a,b)+c ≥
+    max(a, b+c) for c≥0, which can overstate a lower bound and risk
+    T_bound > T_measured (violating the §4.0 conservatism theorem).
+    The max(a, b+c) form is the tightest provable lower bound.
 ```
 
 The bound is computed, stated, done. No search.
@@ -437,7 +443,7 @@ TIER 2 — Component floor (from HIVM of one core):
                          (one drain L0C→GM + load GM→UB, minimum cost)
 
 BOUND:
-  T_bound = max(T_grid_floor, T_core_floor) + T_serial_irreducible
+  T_bound = max(T_grid_floor, T_core_floor + T_serial_irreducible)
   Here occupancy=0.80 likely makes T_grid_floor bind → the FIRST
   optimization is not any per-core gap, it is the GRID: raise G to ≥20 by
   shrinking BLOCK_M, recovering the 4 idle cores. The model surfaces this

@@ -24,6 +24,9 @@ _RECOMMENDATIONS = {
     "gap4_intra_unit_exec": "Increase SIMD repeat/mask utilization",
 }
 
+# Threshold below which all gaps are considered negligible ("at bound")
+_AT_BOUND_EPS = 1e-4
+
 
 @dataclass
 class KernelReport:
@@ -114,8 +117,24 @@ class KernelReport:
     def from_bound(cls, result: BoundResult,
                    two_limit: Optional[TwoLimitResult] = None) -> "KernelReport":
         """Create a report from a BoundResult."""
-        dominant_name, _ = result.attribution.dominant_gap()
-        action = _RECOMMENDATIONS.get(dominant_name, "Profile to identify bottleneck")
+        dominant_name, dominant_frac = result.attribution.dominant_gap()
+
+        # At-bound detection: when all gap fractions are below ε, the kernel
+        # is at its analytical bound — no actionable software gap remains.
+        total_gap_frac = (
+            result.attribution.grid_gap_frac
+            + result.attribution.gap1_frac
+            + result.attribution.gap2_frac
+            + result.attribution.gap3_frac
+            + result.attribution.gap4_frac
+        )
+        if total_gap_frac < _AT_BOUND_EPS:
+            action = (
+                "At component bound — no actionable software gap "
+                "(consider algorithmic redesign: fusion/precision/less traffic)"
+            )
+        else:
+            action = _RECOMMENDATIONS.get(dominant_name, "Profile to identify bottleneck")
 
         return cls(
             kernel_name=result.kernel_name,

@@ -58,7 +58,11 @@ def _run_cli(tool: Path, args: list[str], out_file: Path) -> subprocess.Complete
 @requires_tritonsim_hivm
 @requires_fixtures
 class TestTritonsimHivmCLI:
-    """Tests using tritonsim-hivm --des-graph-file."""
+    """Tests using tritonsim-hivm --des-graph-file.
+
+    These tests exercise the typed HIVM dialect parser backed by bishengir
+    libraries built from AscendNPU-IR's LLVM 19.1.7 tree.
+    """
 
     def test_des_graph_emitted(self, tmp_path):
         """tritonsim-hivm emits valid JSON with 'operations' array."""
@@ -72,14 +76,13 @@ class TestTritonsimHivmCLI:
             cmd.extend(["--hardware-config", str(HW_CONFIG)])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-        # If the tool fails on this fixture, xfail with the stderr so we
-        # track the gap without silently passing.
-        if result.returncode != 0 or not out_file.exists() or out_file.stat().st_size == 0:
-            pytest.xfail(
-                f"tritonsim-hivm failed on fixture (returncode={result.returncode}): "
-                f"{result.stderr[:300]}"
-            )
+        assert result.returncode == 0, (
+            f"tritonsim-hivm failed (returncode={result.returncode}): "
+            f"{result.stderr[:300]}"
+        )
+        assert out_file.exists() and out_file.stat().st_size > 0, (
+            "DES graph file was not emitted by tritonsim-hivm"
+        )
 
         data = json.loads(out_file.read_text())
         assert "operations" in data or "nodes" in data
@@ -98,12 +101,13 @@ class TestTritonsimHivmCLI:
             cmd.extend(["--hardware-config", str(HW_CONFIG)])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-        if result.returncode != 0 or not out_file.exists() or out_file.stat().st_size == 0:
-            pytest.xfail(
-                f"tritonsim-hivm failed on fixture (returncode={result.returncode}): "
-                f"{result.stderr[:300]}"
-            )
+        assert result.returncode == 0, (
+            f"tritonsim-hivm failed (returncode={result.returncode}): "
+            f"{result.stderr[:300]}"
+        )
+        assert out_file.exists() and out_file.stat().st_size > 0, (
+            "DES graph file was not emitted by tritonsim-hivm"
+        )
 
         ops = load_hivm_desgraph(out_file)
         assert len(ops) > 0, "Parsed operations must be non-empty"
@@ -112,8 +116,16 @@ class TestTritonsimHivmCLI:
 @requires_tritonsim_opt
 @requires_fixtures
 class TestTritonsimOptHIVMAnalysis:
-    """Tests using tritonsim-opt --analyze-hivm with des-graph-file."""
+    """Tests using tritonsim-opt --analyze-hivm with des-graph-file.
 
+    All tests in this class are xfailed until Gap #1 (C++ HIVM parser fix) is resolved.
+    The parser currently fails with "unsupported memory space Attribute" errors.
+    """
+
+    @pytest.mark.xfail(
+        reason="Gap #1: C++ HIVM parser broken — needs bishengir build or text-parser extension",
+        raises=AssertionError,
+    )
     def test_des_graph_via_opt(self, tmp_path):
         """tritonsim-opt --analyze-hivm emits DES graph when option set."""
         out_file = tmp_path / "opt_des.json"
@@ -128,12 +140,13 @@ class TestTritonsimOptHIVMAnalysis:
             "--analyze-hivm=" + ",".join(opts_list),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-        if result.returncode != 0 or not out_file.exists() or out_file.stat().st_size == 0:
-            pytest.xfail(
-                f"tritonsim-opt failed on fixture (returncode={result.returncode}): "
-                f"{result.stderr[:300]}"
-            )
+        assert result.returncode == 0, (
+            f"tritonsim-opt failed (returncode={result.returncode}): "
+            f"{result.stderr[:300]}"
+        )
+        assert out_file.exists() and out_file.stat().st_size > 0, (
+            "DES graph file was not emitted by tritonsim-opt"
+        )
 
         data = json.loads(out_file.read_text())
         assert "operations" in data or "nodes" in data

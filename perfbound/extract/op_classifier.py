@@ -39,6 +39,16 @@ PIPE_TO_COMPONENT = {
     "VectorMTE2": Component.MTE_GM,   # GM → UB for vector path
     "MTE3": Component.MTE_UB,         # UB → GM
     "Scalar": Component.SCALAR,
+    # HIVMAnalysis.cpp internal pipe names (PIPE_* enum)
+    "PIPE_M": Component.CUBE,         # Matrix (Cube)
+    "PIPE_V": Component.VECTOR,
+    "PIPE_S": Component.SCALAR,
+    "PIPE_MTE2_C": Component.MTE_GM,  # Cube MTE2: GM → L1
+    "PIPE_MTE2_V": Component.MTE_GM,  # Vector MTE2: GM → UB
+    "PIPE_MTE1": Component.MTE_L1,    # MTE1: L1 → L0A/B
+    "PIPE_MTE3": Component.MTE_UB,    # MTE3: UB → GM
+    "PIPE_FIX": Component.MTE_UB,     # FixPipe: L0C → GM
+    "PIPE_ALL": Component.SCALAR,     # catch-all for sync/unclassified ops; filtered as sync
 }
 
 # PipelineAnalysis hw_unit → Component mapping

@@ -269,13 +269,25 @@ def _install_compile_command_capture(dump_dir):
             return original_run(*args, **kwargs)
 
         # Run the original compile to completion.
-        ret = original_run(*args, **kwargs)
+        # Note: the triton compiler uses subprocess.run(..., check=True), so
+        # a non-zero exit raises CalledProcessError rather than returning a
+        # CompletedProcess with returncode != 0.  We catch both paths.
+        ret = None
+        compile_exception = None
+        try:
+            ret = original_run(*args, **kwargs)
+        except subprocess.CalledProcessError as exc:
+            compile_exception = exc
 
-        # If successful, run a secondary dump-only invocation.
-        if ret.returncode == 0:
-            if _dump_npuir_secondary(cmd):
-                _exit_success()
+        # Always attempt secondary HIVM dump.
+        # This runs whether primary succeeded or crashed — if the compiler
+        # printed HIVM IR to stdout before crashing, we can still capture it.
+        if _dump_npuir_secondary(cmd):
+            _exit_success()
 
+        # Secondary dump failed; propagate the original outcome.
+        if compile_exception is not None:
+            raise compile_exception
         return ret
 
     def wrapped_check_call(*args, **kwargs):
@@ -420,6 +432,25 @@ def _install_torch_npu_compat():
 
     if not hasattr(torch.Tensor, "npu"):
         torch.Tensor.npu = lambda self, *a, **kw: self
+
+
+def _install_triton_extra_cann_stub():
+    """Register a no-op tl.extra.cann.extension so kernels using compile_hint
+    can be parsed by the Triton AST walker without the real CANN extension."""
+    try:
+        import triton.language as tl
+        extra = getattr(tl, "extra", None)
+        if extra is None:
+            return
+        cann = getattr(extra, "cann", None)
+        if cann is not None:
+            return  # real CANN extension already registered
+        extension = types.SimpleNamespace(
+            compile_hint=lambda *a, **kw: None,
+        )
+        extra.cann = types.SimpleNamespace(extension=extension)
+    except Exception:
+        pass
 
 
 def _install_compile_only_mock():
@@ -610,6 +641,7 @@ def main():
     os.environ.setdefault("TRITON_ENABLE_TASKQUEUE", "0")
     _normalize_ascend_env()
     _install_compile_only_mock()
+    _install_triton_extra_cann_stub()
     _install_header_compat()
     _install_compile_command_capture(args.dump_dir)
     _install_capture_hook(args.dump_dir)

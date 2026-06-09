@@ -136,6 +136,7 @@ def classify_handoffs(
     handoffs: List[HandoffRecord],
     mandatory_handoff_cycles: float = 0.0,
     clock_ghz: float = 1.85,
+    memory=None,
 ) -> SerializationSplit:
     """Classify each handoff as mandatory or avoidable.
 
@@ -152,6 +153,8 @@ def classify_handoffs(
                                   mandatory handoff (L0C→GM + GM→UB).
                                   From M1 handoff_min.cce microbench.
         clock_ghz: Core clock frequency (1.85 GHz default).
+        memory: Optional MemHierarchy for computing avoidable-handoff cost
+                (Gap 3).  If None, avoidable cost is 0 (conservative default).
 
     Returns:
         SerializationSplit with classified handoffs and T_serial_irreducible.
@@ -196,15 +199,32 @@ def classify_handoffs(
         # No calibration — flag but don't fail
         t_serial_mandatory_us = 0.0
 
-    # Avoidable serialization: sum of handoff costs that COULD be eliminated
-    # (for Gap 3 attribution).  Each avoidable handoff costs its transfer time.
+    # Avoidable serialization: dedup by (producer, consumer) component pair
+    # to prevent double-counting from immediate/canonical edge pairs emitted
+    # by the extractor (hivm_extractor.py:329-334).
+    #
+    # Cost per distinct avoidable handoff via the same memory.lookup_bw path
+    # _compute_gap2 uses (bytes/BW).  This is a conservative UPPER estimate
+    # of the stall — true Gap 3 is only the non-overlapped portion; an
+    # overlap model is a later refinement.  Diagnostic-only, never enters
+    # T_bound, so over-estimation cannot break conservatism.
     t_serial_avoidable_us = 0.0
-    for h in avoidable:
-        # Transfer time at sustained BW (bytes / BW)
-        # bytes_transferred is on the handoff; we use the BW from the model
-        if h.bytes_transferred > 0:
-            # Conservative: assume worst-case alignment
-            t_serial_avoidable_us += 0.0  # computed from BW, deferred to Gap 3
+    if avoidable:
+        # Dedup by (producer_component, consumer_component)
+        seen_avoidable: set[tuple[Component, Component]] = set()
+        for h in avoidable:
+            edge = (h.producer_component, h.consumer_component)
+            if edge in seen_avoidable:
+                continue
+            seen_avoidable.add(edge)
+            if h.bytes_transferred > 0 and memory is not None:
+                # Estimate transfer time at sustained BW
+                try:
+                    bw, _ = memory.lookup_bw("gm", "ub", pkt_size=h.bytes_transferred)
+                    if bw > 0:
+                        t_serial_avoidable_us += h.bytes_transferred / bw
+                except KeyError:
+                    pass  # no BW data — conservative 0
 
     return SerializationSplit(
         mandatory_handoffs=mandatory,

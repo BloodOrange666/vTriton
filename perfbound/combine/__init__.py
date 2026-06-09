@@ -1,6 +1,6 @@
 # M5 — Bound Combiner + Five-Way Attribution
 #
-# T_bound = max(T_grid_floor, T_core_floor) + T_serial_irreducible
+# T_bound = max(T_grid_floor, T_core_floor + T_serial_irreducible)
 #
 # Five-way attribution (separate from 6 roofline components):
 #   1. grid        — realized grid vs optimal partition

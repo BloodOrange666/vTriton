@@ -13,7 +13,10 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..extract.op_classifier import Precision
 
 # ── Precision / DType ──────────────────────────────────────────────────────
 
@@ -225,6 +228,10 @@ class VectorConfig:
     # Per-operation cycles per vector instruction (128-element SIMD chunk)
     op_cycles: dict[tuple[VecOpType, DType], float] = field(default_factory=dict)
 
+    # Scalar throughput (rough estimate for two-limit Gap-1 analysis)
+    # Scalar is ~10-50× slower than Vector; use conservative 20× slower than Vector FP16
+    scalar_throughput_fp16_tflops: float = 0.0  # optional; defaults to Vector/20 if not set
+
     def get_op_cycles(self, op: VecOpType, dtype: DType) -> float:
         """Cycles for one vector instruction of this op+dtype."""
         key = (op, dtype)
@@ -235,6 +242,36 @@ class VectorConfig:
         if fallback in self.op_cycles:
             return self.op_cycles[fallback]
         return 1.0  # conservative default
+
+    def get_scalar_throughput_ops_per_us(self, prec_str: str) -> float:
+        """Rough Scalar throughput in operations per microsecond.
+
+        Scalar is ~10-50× slower than Vector; we use a conservative 20× slower
+        than Vector FP16 for two-limit Gap-1 analysis. This is NOT a calibrated
+        constant — just a rough proxy to make two-limit non-vacuous.
+
+        Args:
+            prec_str: Precision string (e.g., "fp16", "bf16", "fp32")
+
+        Returns 0.0 if Vector throughput is not calibrated.
+        """
+        prec_lower = prec_str.lower() if prec_str else ""
+        if prec_lower in ("fp16", "bf16"):
+            vec_tflops = self.throughput_fp16_tflops
+        elif prec_lower == "fp32":
+            vec_tflops = self.throughput_fp32_tflops
+        else:
+            return 0.0
+
+        if vec_tflops <= 0:
+            return 0.0
+
+        # Use explicit scalar throughput if set, else default to Vector/20
+        scalar_tflops = self.scalar_throughput_fp16_tflops
+        if scalar_tflops <= 0:
+            scalar_tflops = vec_tflops / 20.0
+
+        return scalar_tflops * 1e6  # FLOP/us
 
 
 # ── Memory Bandwidth ───────────────────────────────────────────────────────

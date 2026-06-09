@@ -151,7 +151,7 @@ mandatory minimum costs into `T_serial_irreducible`.
 ## A.5 Module 5 — Bound Combiner & Attribution (Week 7)
 
 ```
-    T_bound = max(T_grid_floor, T_core_floor) + T_serial_irreducible
+    T_bound = max(T_grid_floor, T_core_floor + T_serial_irreducible)
     binding = argmax(grid_floor vs each component) + which tier
     gaps = {gap1, gap2, gap3, gap4} computed from Module 3 deltas
     T_bound_HIVM vs T_bound_DSL (see A.7)

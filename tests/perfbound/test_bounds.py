@@ -20,9 +20,9 @@ from perfbound.calibration.calib_loader import load_default_calib_db
 from perfbound.model.bounds import compute_bounds
 
 
-def _make_grid(n_cores=20, occupancy=1.0, load_balance=1.0) -> GridInfo:
+def _make_grid(n_cores=20, occupancy=1.0, load_balance=1.0, total_programs=1) -> GridInfo:
     return GridInfo(
-        grid_dims=(n_cores,), total_programs=n_cores,
+        grid_dims=(n_cores,), total_programs=total_programs,
         tile_assignment={}, work={},
         occupancy=occupancy, load_balance=load_balance,
         redundancy=1.0, busiest_core_id=0,
@@ -48,7 +48,8 @@ class TestComputeBoundsMemoryBound:
                               unit_assignment={1: "cube", 2: "mte_gm"})
         db = load_default_calib_db()
         grid = _make_grid()
-        result = compute_bounds(grid, extract, db)
+        result = compute_bounds(grid, extract, db,
+                                n_cores=20, total_programs=1)
 
         # MTE_GM should bind at component level
         assert result.component.binding_component == Component.MTE_GM
@@ -75,7 +76,8 @@ class TestComputeBoundsComputeBound:
                               unit_assignment={1: "cube"})
         db = load_default_calib_db()
         grid = _make_grid()
-        result = compute_bounds(grid, extract, db)
+        result = compute_bounds(grid, extract, db,
+                                n_cores=20, total_programs=1)
 
         # Cube should bind at component level
         assert result.component.binding_component == Component.CUBE
@@ -111,7 +113,8 @@ class TestComputeBoundsIntegration:
                               unit_assignment={1: "cube", 2: "mte_gm"})
         db = load_default_calib_db()
         grid = _make_grid()
-        pieces = compute_bounds(grid, extract, db)
+        pieces = compute_bounds(grid, extract, db,
+                                n_cores=20, total_programs=1)
 
         result = combine(pieces.grid, pieces.component, pieces.serial,
                          kernel_name="test_bounds_combine", extract=extract)
