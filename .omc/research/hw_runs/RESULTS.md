@@ -109,6 +109,45 @@ fixed startup latency. Bounded `inefficiency ∈ (0,1)` keeps the bound sound.
 per-instruction model does not use it; a lane-fill `mask` model is a future
 refinement).
 
+## 6. HIVM IR optimization feasibility analysis (2026-06-11)
+
+Post-closure of US-SB-008, analysis of whether HIVM IR can be directly edited
+or hinted for performance optimization. The two-limit result for chunk_kda:
+
+```
+T_bound_HIVM = 46,065 µs  (idealized — Gap-1/3 relaxed)
+T_bound_DSL  = 46,110 µs  (realized bishengir structure)
+T_measured   = 104,326 µs (actual on 910B3 NPU:1)
+
+Compiler headroom = T_bound_DSL − T_bound_HIVM = 44.99 µs  (0.04%)
+Author headroom   = T_measured  − T_bound_DSL  = 58,216 µs (55.8%)
+```
+
+### Intervention levels
+
+| Level | Gap owned | Feasibility | Max win |
+|-------|-----------|-------------|---------|
+| HIVM IR (des.json) editing | Gap-1/3 | Model only — bishengir-compile cannot accept des.json | ~45 µs |
+| bishengir MLIR hints (ascend-tiling-opt) | Gap-4 (2.6%) | Actionable — modify MLIR, standard compile | ~2.7 ms |
+| Triton kernel rewrite (author level) | Author headroom (55.8%) | Highest impact — tiling, fusion, layout | ~58 ms |
+
+### Gap attribution guide for hints
+
+| Gap | Attribution (chunk_kda) | What to hint |
+|-----|------------------------|-------------|
+| Gap-1 (placement) | 0.16% | Memory level assignment for intermediates |
+| Gap-2 (coalescing) | 0% | Already optimal for chunk_kda |
+| Gap-3 (serialization) | 0% | Pipeline overlap structure |
+| Gap-4 (intra-unit exec) | **2.6%** | Instruction scheduling, repeat count, vector width |
+
+### Conclusion
+
+The compiler is near-optimal for chunk_kda. The 55.8% performance opportunity
+is at the Triton kernel author level — tiling strategy, op fusion, and memory
+access pattern. `ascend-tiling-opt` is the tool to search this space using the
+white-box model. Direct HIVM IR editing provides marginal improvement (~0.04%)
+and lacks a back-compilation path to hardware.
+
 ## Reproduce
 
 ```bash

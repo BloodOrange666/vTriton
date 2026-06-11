@@ -81,5 +81,49 @@
 - 354 passed, 3 skipped, 2 xfailed (up from 332 + 22 new tests)
 - Zero regressions
 
+### US-SB-008 HIVM Optimization Feasibility Analysis (2026-06-11)
+
+Post-closure analysis of whether HIVM IR can be directly edited or hinted for
+performance optimization, given the two-limit findings:
+
+**HIVM IR (des.json) editing:**
+- HivmEdit primitives (raise_repeat, insert_pingpong, merge_transfers) work on des.json
+- Back-compilation path broken: bishengir-compile accepts MLIR, not des.json
+- Cannot execute edited des.json on hardware
+- Can model counterfactual T_bound from edited des.json (this IS T_bound_HIVM)
+
+**bishengir MLIR hint injection — the actionable path:**
+- ascend-tiling-opt can modify tiling, memory placement, pipeline scheduling
+- Gap attribution guides which hint to give:
+  Gap-4 (2.6%) → instruction-level scheduling within vector unit
+  Gap-1 (0.16%) → memory level assignment for intermediates
+  Gap-2 (0%) → already optimal for chunk_kda
+  Gap-3 (0%) → pipeline overlap already good
+- Standard bishengir-compile pipeline applies hints, no toolchain changes
+
+**Author-level kernel rewrite — the 55.8% opportunity:**
+- T_bound_HIVM=46,065 ≤ T_bound_DSL=46,110 ≤ T_measured=104,326 µs
+- Author headroom=58,216 µs (55.8%) >> compiler headroom=44.99 µs (0.04%)
+- Biggest wins: tiling changes, op fusion, memory access restructuring
+- ascend-tiling-opt searches this space using the white-box model
+
+**Conclusion:** Don't edit HIVM IR directly — the back-compilation path is broken.
+Instead use the model's gap analysis to guide kernel-level changes, then let the
+standard bishengir pipeline compile them. The 55.8% headroom is at the kernel
+author's feet.
+
 ### Remaining open stories
 - US-SB-005 (Task 2): Multi-kernel validation set n≥5 — need ≥2 more kernels (softmax, layernorm)
+
+### Stage-B Summary (7/8 stories complete)
+
+| Story | Title | Status |
+|-------|-------|--------|
+| US-SB-001 | Fix C++ extractRepeatMask parsing | ✅ |
+| US-SB-002 | Surface DES maxIterations flag | ✅ |
+| US-SB-003 | Real des.json for chunk_kda (THE GATE) | ✅ (caveat: FLOP reconciliation) |
+| US-SB-004 | Source repeat/mask from correct IR stage | ✅ (analytical derivation) |
+| US-SB-005 | Multi-kernel validation set n≥5 | ❌ (3/5 kernels, need softmax+layernorm) |
+| US-SB-006 | Live counterfactual validation | ✅ (quant_error=3.0%) |
+| US-SB-007 | Scalar throughput calibration | ✅ (P_scalar=0.118 GFLOPS) |
+| US-SB-008 | Two-limit compiler-headroom | ✅ (compiler=0.04%, author=55.8%) |
