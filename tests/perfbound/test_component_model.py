@@ -391,15 +391,19 @@ class TestIntegration:
         from perfbound.model.serialization import classify_handoffs
         from perfbound.combine.bound_combiner import combine
 
-        # Extract with a mis-placed op: 'add' on Cube pipe (should be Vector)
+        # Extract with a mis-placed op: 'add' on Cube pipe (should be Vector).
+        # repeat reflects the analytical SIMD iteration count the C++ emitter
+        # now derives (4096 fp16 elems / (2048/16) lanes = 32), so the
+        # per-instruction Gap-4 sees a realistically-batched op rather than the
+        # impossible repeat=1-with-4096-elements placeholder.
         ops = [
             OpRecord(op_id=1, op_name="add", component=Component.CUBE,
                      precision=Precision.FP16, pipe="Cube",
-                     bytes_transferred=0, elements=4096,
+                     bytes_transferred=0, elements=4096, repeat=32,
                      duration_cycles=10, loop_multiplier=1, depends_on=[]),
             OpRecord(op_id=2, op_name="vector_add", component=Component.VECTOR,
                      precision=Precision.FP16, pipe="Vector",
-                     bytes_transferred=0, elements=4096,
+                     bytes_transferred=0, elements=4096, repeat=32,
                      duration_cycles=10, loop_multiplier=1, depends_on=[]),
         ]
         extract = HIVMExtract(operations=ops, handoffs=[])
@@ -426,7 +430,9 @@ class TestIntegration:
         assert result.attribution.gap2_coalescing_us == 0.0
         # Gap 3: no handoffs → 0
         assert result.attribution.gap3_avoidable_serial_us == 0.0
-        # Gap 4: no repeat/mask data → 0
+        # Gap 4: ops are optimally batched (repeat=32 == optimal SIMD iters for
+        # 4096 elems / 128 lanes), so there is no avoidable per-instruction
+        # overhead → Gap 4 = 0.
         assert result.attribution.gap4_intra_unit_exec_us == 0.0
 
         # Dominant gap should be gap1

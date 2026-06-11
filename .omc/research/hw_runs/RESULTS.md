@@ -74,9 +74,50 @@ break the `||` fallbacks on first real run), plus an unrecognised `msprof
 single-brace shell groups, `command -v msprof` preflight, `bishengir-compile`
 on PATH. Config in `~/.vtriton_remote` (host `910B3`).
 
+## 5. Gap 4 (repeat/mask) — IR-stage investigation + analytical derivation (2026-06-11)
+
+**Question (US-SB-004 / Task 4b):** where do per-op CCE `repeat`/`mask` first
+appear in the lowering pipeline, so the model can read them?
+
+**Finding — they are NOT in any parseable MLIR stage we can reach:**
+- `grep repeat` on the dumped `chunk_kda_kernel_clean.npuir.mlir`
+  (post-`GraphSyncSolver` `hivm.hir`) → **0 hits**; the only `mask` token is
+  `set_mask_norm`. Same for `test/hivm_add_kernel.npuir.mlir` and
+  `hivm_mixed_cv_kernel.npuir.mlir` → repeat/mask are absent at the npuir level
+  for **every** kernel, not just chunk_kda.
+- They materialize only in later bishengir CCE/binary codegen. Attempting to
+  dump that via `bishengir-compile --mlir-print-ir-after-all
+  --mlir-print-ir-tree-dir` **times out (>600 s, even plain compile)** and the
+  per-pass tree never flushes — not a viable extraction path.
+
+**Resolution — derive `repeat` analytically (no device / no bishengir needed):**
+the iteration count is a function of data already in the IR. The C++ emitter
+(`HIVMAnalysis.cpp`, after element/byte inference) sets
+`repeat = ceil(elements / (2048 / bitsPerElem))` — a 256-byte vector register
+processes `2048/bits` elements per iteration (matches `AscendModelOps.cpp`).
+On the real `kda_des.json` this fills **271 / 1378 ops with repeat>1** (8/16/32/64).
+
+**Gap-4 model = per-instruction issue overhead** (`bound_combiner._compute_gap4`):
+an op whose `repeat` already packs its iterations into the minimum number of
+instructions has **0** avoidable overhead; a suboptimally-low repeat (the
+paper's AvgPool `repeat=1` case) issues many instructions, each paying the
+fixed startup latency. Bounded `inefficiency ∈ (0,1)` keeps the bound sound.
+
+**Result on chunk_kda:** real Tier-2 bound `t_bound = 46,110 µs ≤ t_measured =
+104,326 µs` (**2.26×** — vs the 75× HBM grid floor); Gap-4 is non-zero
+(~2.6% of measured) and now the dominant attributed gap. `mask` is left 0 (the
+per-instruction model does not use it; a lane-fill `mask` model is a future
+refinement).
+
 ## Reproduce
 
 ```bash
+# Regenerate kda_des.json with analytical repeat (local, no device):
+build/bin/tritonsim-hivm \
+  --npuir-file=.omc/research/hw_runs/chunk_kda_kernel_clean.npuir.mlir \
+  --des-graph-file=.omc/research/hw_runs/kda_des.json \
+  --hardware-config=configs/ascend_910b.json --scheduler=static
+
 # config: ~/.vtriton_remote -> [remote] host=910B3 path=/root/vTriton
 rsync -az --exclude=.git --exclude=build --exclude=thirdparty ./ 910B3:/root/vTriton/
 ssh 910B3 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && \

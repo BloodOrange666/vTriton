@@ -945,6 +945,48 @@ static bool populateGenericHivmOp(mlir::Operation *op, ParsedOp &parsed) {
 }
 #endif
 
+/// Extract CCE repeat and mask state from an MLIR operation.
+///
+/// Repeat is sourced from:
+///   1. An explicit ``repeat`` integer attribute on the op (if present).
+///   2. A ``repeat = N`` pattern in the rendered op text (fallback).
+///
+/// Mask is sourced from:
+///   1. A ``mask_count`` integer attribute on the op (if present).
+///
+/// Defaults (repeat=1, mask=0) are left intact when no data is found.
+static void extractRepeatMask(mlir::Operation *op, ParsedOp &parsed) {
+  // 1. Explicit integer attribute "repeat"
+  if (auto attr = op->getAttrOfType<mlir::IntegerAttr>("repeat"))
+    parsed.op.repeat = std::max<int64_t>(1, attr.getInt());
+
+  // 2. Fallback: parse "repeat = N" from rendered op text.
+  if (parsed.op.repeat == 1 && !parsed.op.text.empty()) {
+    llvm::StringRef txt = parsed.op.text;
+    auto pos = txt.find("repeat = ");
+    if (pos != llvm::StringRef::npos) {
+      // Anchor: preceding char must NOT be an identifier char — prevents
+      // matching "loop_repeat = 4" at the wrong offset.
+      bool anchored = (pos == 0 ||
+                       (!std::isalnum(static_cast<unsigned char>(txt[pos - 1])) &&
+                        txt[pos - 1] != '_'));
+      if (anchored) {
+        int64_t val = 0;
+        llvm::StringRef tail = txt.drop_front(pos + 9); // len("repeat = ")
+        // consumeInteger parses a leading integer and tolerates trailing text
+        // (e.g. "8 : i64}" from the rendered "repeat = 8 : i64"), whereas
+        // getAsInteger fails on any trailing chars.
+        if (!tail.consumeInteger(10, val) && val >= 1)
+          parsed.op.repeat = val;
+      }
+    }
+  }
+
+  // 3. Explicit integer attribute "mask_count"
+  if (auto attr = op->getAttrOfType<mlir::IntegerAttr>("mask_count"))
+    parsed.op.mask = std::max<int64_t>(0, attr.getInt());
+}
+
 static std::string renderValueToken(mlir::Value value) {
   if (!value)
     return "";
@@ -2135,6 +2177,8 @@ static void analyzeParsedOperation(mlir::Operation *op, int64_t loopMultiplier,
     parsed.op.text = opText;
     if (parsed.op.opName.empty())
       parsed.op.opName = getLeafOpName(op).str();
+    // Extract CCE repeat/mask from MLIR attributes or op text (Gap 4).
+    extractRepeatMask(op, parsed);
     parsed.mlirResults.assign(op->result_begin(), op->result_end());
 
     for (mlir::Value operand : op->getOperands()) {
@@ -2158,6 +2202,23 @@ static void analyzeParsedOperation(mlir::Operation *op, int64_t loopMultiplier,
       parsed.op.bytes = parseMemRefBytes(parsed.op.text);
     if (parsed.op.elements == 0)
       parsed.op.elements = parseMemRefElementCount(parsed.op.text);
+    // Gap 4: derive the CCE repeat count (SIMD iteration count) analytically
+    // from the op's element count and per-element width.  Per-op repeat/mask
+    // are NOT present in the hivm.hir IR — they only materialize in later CCE
+    // codegen — so we compute the canonical iteration count instead: a
+    // 256-byte (2048-bit) vector register processes (2048/bitsPerElem)
+    // elements per iteration (matches AscendModelOps.cpp's vectorWidth math).
+    // Only fill when extractRepeatMask found no explicit attribute/text
+    // (it leaves repeat==1), so a real CCE repeat field would still win.
+    if (parsed.op.repeat == 1 && parsed.op.elements > 0 && parsed.op.bytes > 0) {
+      int64_t bitsPerElem = (parsed.op.bytes * 8) / parsed.op.elements;
+      if (bitsPerElem > 0) {
+        int64_t laneCount = 2048 / bitsPerElem; // elements per 256B register
+        if (laneCount < 1)
+          laneCount = 1;
+        parsed.op.repeat = (parsed.op.elements + laneCount - 1) / laneCount;
+      }
+    }
 #ifdef TRITONSIM_HAS_BISHENGIR_HIVM
     // Extract src/dst memory spaces from MLIR operand/result types.
     {
@@ -2640,7 +2701,17 @@ static void finalizeDiscreteEventReport(HIVMAnalysisReport &report,
   };
 
   int64_t currentTime = 0;
+  // Safety: prevent infinite loops on degenerate inputs.
+  const size_t maxIterations = numOps * 100 + 10000;
+  size_t iterationCount = 0;
   while (completedCount < numOps) {
+    if (++iterationCount > maxIterations) {
+      llvm::errs() << "DES scheduler: exceeded max iterations ("
+                   << maxIterations << "), completed " << completedCount
+                   << "/" << numOps << " ops\n";
+      report.scheduleTruncated = true;
+      break;
+    }
     bool startedAny = false;
     size_t readyCount = readyOps.size();
     for (size_t i = 0; i < readyCount; ++i) {
@@ -3165,6 +3236,8 @@ void HIVMAnalysisReport::emitDESGraph(llvm::raw_ostream &os,
 
   os << "{\n";
   os << "  \"schema_version\": \"a3_hivm_des_v1\",\n";
+  os << "  \"schedule_truncated\": " << (scheduleTruncated ? "true" : "false")
+     << ",\n";
   os << "  \"clock_ghz\": " << llvm::format("%.3f", config.getClockFrequencyGHz())
      << ",\n";
   os << "  \"operations\": [\n";
@@ -3201,6 +3274,8 @@ void HIVMAnalysisReport::emitDESGraph(llvm::raw_ostream &os,
        << ",\"src_space\":\"" << op.srcSpace << "\""
        << ",\"dst_space\":\"" << op.dstSpace << "\""
        << ",\"elem_type\":\"" << op.elemType << "\""
+       << ",\"repeat\":" << op.repeat
+       << ",\"mask\":" << op.mask
        << "}";
   }
   os << "\n  ]\n}\n";

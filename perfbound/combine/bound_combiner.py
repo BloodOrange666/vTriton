@@ -435,36 +435,74 @@ def _compute_gap4(
     component: ComponentBound,
     calibration: Optional[dict] = None,
 ) -> float:
-    """Estimate Gap 4: intra-unit execution inefficiency.
+    """Estimate Gap 4: intra-unit execution inefficiency (per-instruction).
 
-    For compute ops (Cube, Vector), use repeat/mask fields to estimate
-    SIMD/fractal utilization.  With default values (repeat=1, mask=0)
-    utilization is 100% and Gap 4 = 0.
+    Models the **per-instruction issue overhead** of CCE compute instructions
+    (the paper's AvgPool ``repeat=1`` → 4.31× case).  Each vector/cube op runs
+    ``repeat`` SIMD iterations (256-byte register iterations) split across
+    ``ceil(repeat / MAX_REPEAT)`` hardware instructions, and every instruction
+    pays a fixed startup latency.  When ``repeat`` is small the startup cost is
+    a large fraction of the op's busy time (overhead-dominated); as ``repeat``
+    grows the startup amortizes and the inefficiency → 0.
 
-    Note: repeat/mask are future-populated fields from the C++ emitter.
-    Until HIVMAnalysis exposes per-op repeat and mask in its JSON output,
-    Gap 4 will always be 0.0 for real HIVM data (conservative default).
+    ``repeat`` is derived analytically by the C++ emitter from each op's
+    element count and width (the hivm.hir IR has no per-op repeat/mask — they
+    only appear in later CCE codegen; see Task 4b).  ``mask`` is not used by
+    this model.
+
+    The per-op inefficiency is::
+
+        overhead_cyc = ceil(repeat / MAX_REPEAT) * startup_cyc[component]
+        inefficiency = overhead_cyc / (overhead_cyc + repeat * PER_ITER_CYC)
+
+    bounded in (0, 1), so Gap 4 ≤ Σ op_time ≤ component time ≤ T_measured
+    (keeps the bound sound).
 
     Returns:
-        Estimated intra-unit inefficiency in microseconds.
+        Estimated per-instruction issue overhead in microseconds.
     """
+    # CCE constants.  startup cycles mirror calibration.startup_latencies
+    # (ascend_910b.json); MAX_REPEAT is the 8-bit CCE repeat field limit;
+    # PER_ITER_CYC is the 1-iteration/cycle vector/cube throughput floor.
+    MAX_REPEAT = 255
+    PER_ITER_CYC = 1.0
+    startup_cyc = {Component.VECTOR: 35.0, Component.CUBE: 20.0}
+    if calibration:
+        startups = calibration.get("startup_latencies") or {}
+        if "vector_startup_cycles" in startups:
+            startup_cyc[Component.VECTOR] = float(startups["vector_startup_cycles"])
+        if "cube_startup_cycles" in startups:
+            startup_cyc[Component.CUBE] = float(startups["cube_startup_cycles"])
+
+    # SIMD lanes per 256-byte register iteration.  Matches the 128-wide SIMD
+    # convention used elsewhere in the model (a 4-byte/lane assumption).
+    LANES_PER_ITER = 128
+
     gap4_us = 0.0
 
     for op in extract.operations:
         if op.component not in (Component.CUBE, Component.VECTOR):
             continue
 
-        # Compute utilization from repeat/mask
-        if op.component == Component.VECTOR:
-            # Vector: mask disables lanes (128-wide SIMD)
-            active_lanes = max(0, 128 - op.mask)
-            utilization = active_lanes / 128.0
+        # Intrinsic SIMD iterations this op must perform.
+        if op.elements > 0:
+            optimal_iters = -(-op.elements // LANES_PER_ITER)
         else:
-            # Cube: repeat > 1 means internal iterations
-            utilization = 1.0 / max(1, op.repeat)
-
-        if utilization >= 1.0:
-            continue  # fully utilized — no gap
+            optimal_iters = max(1, op.repeat)
+        # op.repeat is the per-instruction iteration count the compiler used
+        # (CCE repeat field, ≤ MAX_REPEAT).  Optimal batching packs every
+        # iteration into the fewest instructions; a suboptimally-low repeat
+        # (the paper's AvgPool repeat=1) issues many instructions, each paying
+        # the fixed startup latency.  Gap 4 = the *avoidable* startup overhead.
+        per_instr = max(1, min(op.repeat, MAX_REPEAT))
+        n_instr = -(-optimal_iters // per_instr)            # ceil
+        best_instr = -(-optimal_iters // MAX_REPEAT)        # ceil, maximal batch
+        avoidable_instr = max(0, n_instr - best_instr)
+        if avoidable_instr == 0:
+            continue  # already optimally batched — no intra-unit overhead
+        overhead_cyc = avoidable_instr * startup_cyc[op.component]
+        busy_cyc = n_instr * startup_cyc[op.component] + optimal_iters * PER_ITER_CYC
+        inefficiency = overhead_cyc / busy_cyc  # (0, 1)
 
         # Estimate this op's time on its component.
         # Use op.flops as fallback when op.elements is 0 (C++ JSON path
@@ -495,8 +533,8 @@ def _compute_gap4(
         else:
             continue
 
-        # Gap 4 = time lost to sub-optimal utilization
-        gap4_us += (1.0 - utilization) * op_time
+        # Gap 4 = per-instruction startup overhead share of this op's time
+        gap4_us += inefficiency * op_time
 
     return gap4_us
 

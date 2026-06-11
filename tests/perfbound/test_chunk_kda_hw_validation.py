@@ -198,3 +198,87 @@ class TestRealHardwareValidation:
         assert author > 0
         # Headroom is the bulk of the measured time (loose floor, slow kernel).
         assert math.isclose(author, timing.t_us - bound.t_bound_us, rel_tol=1e-9)
+
+
+# ── Real DES-graph bound (Stage-B Task 1) ─────────────────────────────────
+
+KDA_DES_JSON = PROJECT_ROOT / ".omc" / "research" / "hw_runs" / "kda_des.json"
+
+requires_des_json = pytest.mark.skipif(
+    not KDA_DES_JSON.exists(), reason="real kda_des.json fixture not present"
+)
+
+# Analytic grid-floor bound (HBM floor) for comparison.
+# From the handoff doc: the HBM floor was ~1,386 us (75x loose).
+HBM_FLOOR_US = HAND_BYTES_TOTAL / (1.6e12) * 1e6  # ~1,386 us
+
+
+@requires_des_json
+class TestRealDesGraphBound:
+    """Stage-B Task 1d: the real des.json produces a sound, tight Tier-2 bound."""
+
+    @staticmethod
+    def _report():
+        from perfbound.combine.run_report import report_from_desgraph
+        return report_from_desgraph(
+            des_json=str(KDA_DES_JSON),
+            grid_dims=(128, 32),
+            n_cores=20,
+            kernel_name="chunk_kda",
+            t_measured_us=104326.0,
+        )
+
+    def test_bound_is_positive(self):
+        """The real-bound extraction yields a positive t_bound_us."""
+        report = self._report()
+        assert report.t_bound_us > 0
+
+    def test_soundness_bound_le_measured(self):
+        """Core soundness: T_bound ≤ T_measured on the real des.json extract."""
+        report = self._report()
+        assert report.t_bound_us <= report.t_measured_us, (
+            f"BOUND VIOLATION: t_bound={report.t_bound_us:.2f} us > "
+            f"t_measured={report.t_measured_us:.2f} us"
+        )
+
+    def test_tighter_than_hbm_floor(self):
+        """The real Tier-2 bound is tighter than the analytic HBM grid floor."""
+        report = self._report()
+        assert report.t_bound_us > HBM_FLOOR_US, (
+            f"Real bound {report.t_bound_us:.2f} us should exceed "
+            f"HBM floor {HBM_FLOOR_US:.2f} us (Tier-2 should be tighter)"
+        )
+
+    def test_des_json_has_expected_op_types(self):
+        """The des.json contains Cube, Vector, and MTE ops (full HIVM extract)."""
+        from perfbound.extract.hivm_extractor import load_hivm_desgraph
+        ops = load_hivm_desgraph(str(KDA_DES_JSON))
+        components = {op.component for op in ops}
+        assert Component.CUBE in components, "des.json must contain Cube ops"
+        assert Component.VECTOR in components, "des.json must contain Vector ops"
+
+    def test_des_json_has_repeat_mask_fields(self):
+        """The C++ emitter populates repeat with REAL analytical values (Task 4).
+
+        repeat = ceil(elements / lanes) is derived analytically at emit time
+        (the post-GraphSyncSolver hivm.hir IR has no per-op CCE repeat/mask, and
+        the late bishengir codegen stage that does is not parseable — see
+        RESULTS.md).  Value-asserting: wide SIMD tiles must produce repeat>1,
+        guarding against the earlier all-default no-op regression.
+        """
+        import json
+        with open(KDA_DES_JSON) as f:
+            data = json.load(f)
+        ops = data["operations"]
+        assert len(ops) > 0
+        assert all("repeat" in op for op in ops), "all ops must have 'repeat' field"
+        assert all("mask" in op for op in ops), "all ops must have 'mask' field"
+        assert all(isinstance(op["repeat"], int) and op["repeat"] >= 1
+                   for op in ops), "repeat must be integer >= 1"
+        assert all(isinstance(op["mask"], int) and op["mask"] >= 0
+                   for op in ops), "mask must be integer >= 0"
+        # Analytical repeat must fire on real SIMD compute ops (not all default).
+        nontrivial = [op for op in ops if op["repeat"] > 1]
+        assert len(nontrivial) > 50, (
+            f"expected many SIMD ops with repeat>1; got {len(nontrivial)}"
+        )

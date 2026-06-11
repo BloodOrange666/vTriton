@@ -22,7 +22,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from .op_classifier import classify_op, Component, Precision
 
@@ -69,9 +69,12 @@ class OpRecord:
     dst_space: str = ""
 
     # Repeat/mask/SIMD-lane params (for Gap 4 intra-unit attribution).
-    # Future-populated: HIVMAnalysis does not yet emit repeat/mask in its
-    # JSON output.  Until the C++ emitter exposes these, both default to
-    # their fully-utilized values (repeat=1, mask=0).
+    # C++ emitDESGraph now emits repeat/mask per op (Task 4a).
+    # For real NPUIR (post-GraphSyncSolver hivm.hir) all ops currently
+    # show repeat=1/mask=0 — the IR stage lacks per-op CCE repeat/mask.
+    # When repeat/mask appear in later IR stages (Task 4b), these fields
+    # will carry real data.  See test_stage_b_fixes.py for value-asserting
+    # tests with non-default repeat/mask.
     repeat: int = 1       # repeat count (>1 means the op iterates internally)
     mask: int = 0         # mask lanes disabled (0 = all lanes active)
 
@@ -137,10 +140,19 @@ def load_hivm_desgraph(path: Path | str) -> List[OpRecord]:
 
     Raises:
         ValueError: If the JSON contains neither ``operations`` nor ``nodes``,
-                    or if any operation is missing required fields.
+                    if any operation is missing required fields, or if the
+                    DES schedule was truncated (incomplete — bound unusable).
     """
     with open(path) as f:
         data = json.load(f)
+
+    # Guard: refuse truncated schedules — the bound would be silently wrong.
+    if data.get("schedule_truncated", False):
+        raise ValueError(
+            "DES graph schedule was truncated (maxIterations exceeded). "
+            "The resulting bound would be invalid — refusing to load. "
+            f"File: {path}"
+        )
 
     # Canonical key: "operations" (matches C++ emitDESGraph at HIVMAnalysis.cpp:3134)
     raw_ops = data.get("operations")
@@ -258,41 +270,107 @@ def _infer_flops_from_loads(ops: List[OpRecord]) -> None:
     the matmul output has elements=M·N, then K = √(M·K · K·N / M·N)
     and flops = 2 · M · N · K.
 
+    Handles expanded mmadL1 sub-ops where the dependency chain is
+    Cube → MTE1 → Scalar(cast) → ... → MTE_GM(nd2nz) by doing a
+    BFS through intermediaries to find the ultimate MTE loads.
+
     Modifies ops in place.
     """
+    from collections import deque
+
     op_by_id = {op.op_id: op for op in ops}
+
+    def _trace_to_mte_loads(cube_op: OpRecord, max_depth: int = 6) -> List[OpRecord]:
+        """BFS from a Cube op's deps to find MTE loads with elements > 0."""
+        found: List[OpRecord] = []
+        visited: Set[int] = set()
+        queue: deque[tuple[int, OpRecord]] = deque()
+
+        for dep_id in cube_op.depends_on:
+            dep = op_by_id.get(dep_id)
+            if dep and dep.op_id not in visited:
+                visited.add(dep.op_id)
+                queue.append((1, dep))
+
+        while queue and len(found) < 2:
+            depth, current = queue.popleft()
+            if depth > max_depth:
+                continue
+
+            # Found an MTE load with actual data
+            if (current.component in (Component.MTE_GM, Component.MTE_L1)
+                    and current.elements > 0):
+                found.append(current)
+                continue
+
+            # Skip sync/flag ops — they don't carry data
+            if current.op_name in ("set_flag", "wait_flag", "pipe_barrier",
+                                    "sync_block_wait", "sync_block_notify"):
+                continue
+
+            # Continue tracing through intermediaries
+            for dep_id in current.depends_on:
+                if dep_id not in visited:
+                    dep = op_by_id.get(dep_id)
+                    if dep:
+                        visited.add(dep_id)
+                        queue.append((depth + 1, dep))
+
+        return found
+
+    _CUBE_COMPUTE_NAMES = {"mmadL1", "mmadL1.cube", "matmul", "mix_matmul",
+                           "mix_group_matmul"}
 
     for op in ops:
         if op.flops > 0:
             continue  # already populated by C++ or depgraph merge
         if op.component != Component.CUBE:
             continue  # only infer for Cube matmul ops
+        # Only infer for actual compute ops, not sync/flag on Cube pipe
+        if op.op_name not in _CUBE_COMPUTE_NAMES:
+            continue
 
-        # Find CubeMTE2 loads feeding this op
-        input_loads = []
+        # Strategy 1: direct MTE_GM loads in depends_on (original path)
+        input_loads: List[OpRecord] = []
         for dep_id in op.depends_on:
             dep = op_by_id.get(dep_id)
             if dep and dep.component == Component.MTE_GM and dep.elements > 0:
                 input_loads.append(dep)
 
+        # Strategy 2: BFS through intermediaries (handles mmadL1 expansion)
+        if len(input_loads) < 2:
+            input_loads = _trace_to_mte_loads(op)
+
         if len(input_loads) < 2:
             continue  # can't infer without two input loads
 
         load_a, load_b = input_loads[0], input_loads[1]
+
+        if load_a.elements <= 0 or load_b.elements <= 0:
+            continue
+
         output_elements = op.elements
 
-        if output_elements <= 0 or load_a.elements <= 0 or load_b.elements <= 0:
-            continue
-
-        # K = sqrt(load_A_elems * load_B_elems / output_elems)
-        k_squared = load_a.elements * load_b.elements / output_elements
-        if k_squared <= 0:
-            continue
-        k = int(round(k_squared ** 0.5))
-        if k <= 0:
-            continue
-
-        op.flops = 2 * output_elements * k
+        if output_elements > 0:
+            # Standard formula: K = sqrt(eA * eB / output)
+            k_squared = load_a.elements * load_b.elements / output_elements
+            if k_squared <= 0:
+                continue
+            k = int(round(k_squared ** 0.5))
+            if k <= 0:
+                continue
+            op.flops = 2 * output_elements * k
+        else:
+            # Fallback when C++ emitter didn't provide output elements
+            # (common for expanded mmadL1.cube sub-ops).
+            # Estimate K from the smaller input and compute flops.
+            # For M×K × K×N matmul: eA=M*K, eB=K*N, flops=2*M*N*K
+            # With K ≈ sqrt(min(eA, eB)): flops ≈ 2 * eA * eB / sqrt(min(eA, eB))
+            min_e = min(load_a.elements, load_b.elements)
+            k_est = int(round(min_e ** 0.5))
+            if k_est <= 0:
+                k_est = 1
+            op.flops = 2 * load_a.elements * load_b.elements // k_est
 
 
 def extract_hivm(

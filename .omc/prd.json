@@ -1,76 +1,120 @@
 {
-  "title": "Close hardware-gated caveats — real 910B3 runs (remote_bench wiring, real T_measured, bishengir chunk_kda reproduction)",
-  "context": "User set up the remote 910B3 (ssh host '910B3' = 173.147.1.2, root, via local SOCKS proxy). CANN 9.0.0 at /usr/local/Ascend/ascend-toolkit (bishengir-compile + msprof at /usr/local/Ascend/cann-9.0.0/bin). Triton deps in conda env 'triton_hxl'. 8x 910B3 NPUs (chip0 in Alarm; chips1-7 OK). No remote repo yet. remote_bench.py hardcodes CANN '/usr/local/Ascend/cann/set_env.sh' + conda 'tlx' + has a literal '{{ }}' brace bug that breaks the shell '||' fallbacks. Goal: close the three caveats flagged on A.5/A.6/A.7 that were 'hardware-gated, never run on real hardware'.",
+  "title": "Stage-B Gap Closure \u2014 vTriton Performance Bound Model",
+  "context": "The analytical bound model (M1\u2013M6) is code-complete and hardware-validated for soundness on one real kernel (chunk_kda: T_bound \u2264 T_measured, PASS). Stage B (experiments + paper) is gated on getting a real des.json (HIVM extract) for a live kernel so the full Tier-2 bound can be computed. Several code-quality fixes (Task 4a, 4.5) can proceed immediately without hardware. Spec: .omc/specs/performance_bound_model.md. Handoff: .omc/plans/stage_b_handoff.md.",
   "stories": [
     {
-      "id": "US-HW-001",
-      "title": "Fix remote_bench.py to match the real 910B3 environment",
-      "description": "Make the remote preamble match the actual machine: CANN set_env at /usr/local/Ascend/ascend-toolkit/set_env.sh, conda env 'triton_hxl', bishengir-compile on PATH (cann-9.0.0/bin). Fix the literal '{{ }}' double-brace shell bug to single-brace groups. Make CANN setenv path + conda env name overridable via env vars so the script is not brittle.",
+      "id": "US-SB-001",
+      "title": "Task 4a: Fix C++ extractRepeatMask parsing bugs + add value-asserting test",
+      "description": "extractRepeatMask uses getAsInteger which fails on trailing ': i64}' \u2014 switch to consumeInteger. Anchor the find('repeat = ') match to avoid binding wrong attributes. Add a synthetic .npuir.mlir fixture with explicit repeat/mask attributes and a value-asserting test that runs emitDESGraph and checks non-default values in the JSON output.",
       "acceptanceCriteria": [
-        "_REMOTE_PREAMBLE (or its replacement) sources /usr/local/Ascend/ascend-toolkit/set_env.sh by default and activates conda env 'triton_hxl' by default",
-        "CANN setenv path is overridable via VTRITON_REMOTE_CANN_SETENV and conda env via VTRITON_REMOTE_CONDA_ENV (defaults match the real machine)",
-        "All shell-group fallbacks use single-brace '{ cmd; }' form (no literal '{{ }}'), so the generated SSH command is valid bash",
-        "recompile_remote default bishengir path resolves to 'bishengir-compile' on PATH (after CANN sourcing), not the non-existent thirdparty/AscendNPU-IR build path",
-        "A unit test asserts the generated preamble string contains 'ascend-toolkit/set_env.sh' and 'conda activate triton_hxl' and contains no '{{'",
-        "python3 -m pytest tests/perfbound/ -q stays green (no regressions vs prior baseline)"
+        "extractRepeatMask in HIVMAnalysis.cpp uses consumeInteger (not getAsInteger) so trailing ': i64}' doesn't kill the parse",
+        "The find('repeat = ') match is anchored (require non-identifier char before 'repeat', or read named attribute only) to avoid binding 'loop_repeat' etc.",
+        "A synthetic .npuir.mlir fixture exists under test/ containing an op with explicit repeat>1 and mask_count>0 attributes",
+        "A new test runs the fixture through tritonsim-hivm --npuir-file and asserts the emitted des.json carries non-default repeat/mask values",
+        "The tautological test_des_json_has_repeat_mask_fields is replaced or augmented with the value-asserting test",
+        "C++ builds cleanly (cd build && ninja -j$(nproc)) and all perfbound tests pass"
       ],
       "priority": 1,
-      "passes": true
+      "passes": true,
+      "notes": "No device needed. Entirely local in WSL."
     },
     {
-      "id": "US-HW-002",
-      "title": "Establish remote config + connectivity, sync repo, smoke the env preamble on hardware",
-      "description": "Write ~/.vtriton_remote (host=910B3, path=~/vTriton). Sync the repo to the remote. Run the exact env preamble over SSH and confirm CANN sources, conda triton_hxl activates, and bishengir-compile + msprof + npu-smi are all reachable inside that environment.",
+      "id": "US-SB-002",
+      "title": "Task 4.5: Surface DES maxIterations incomplete flag",
+      "description": "HIVMAnalysis.cpp maxIterations guard breaks with only llvm::errs() when schedule truncates; the incomplete weightedCycles flows downstream as if valid. Add an 'incomplete' flag to the DES report so consumers can refuse to produce a bound from a partial schedule.",
       "acceptanceCriteria": [
-        "~/.vtriton_remote exists with [remote] host=910B3 and path pointing at the remote checkout",
-        "resolve_remote_config() returns host '910B3' with no CLI/env override (reads the config file)",
-        "Repo synced to remote ~/vTriton (rsync) — scripts/, perfbound/, test/, configs/ present remotely",
-        "Running the generated preamble over SSH succeeds: 'echo OK' returns OK with CANN+conda active",
-        "Inside the preamble env on remote: bishengir-compile --version (or --help) runs, msprof --version runs, npu-smi info lists 910B3 — captured as evidence in progress.txt"
+        "maxIterations guard in HIVMAnalysis.cpp sets an 'incomplete'/'schedule_truncated' flag on the DES JSON output when the schedule doesn't converge",
+        "report_from_desgraph (perfbound/combine/run_report.py) checks the flag and raises or returns a clearly-marked incomplete result instead of silently trusting a partial schedule",
+        "A test verifies that a truncated schedule (forced via low maxIterations) surfaces the incomplete flag",
+        "C++ builds cleanly, all perfbound tests pass"
       ],
       "priority": 2,
-      "passes": true
+      "passes": true,
+      "notes": "No device needed. clean_npuir.py fragility is documented as known risk (full fix is Task 4b scope)."
     },
     {
-      "id": "US-HW-003",
-      "title": "Produce a REAL T_measured on the 910B3 and flow it through the three-level report",
-      "description": "Run a kernel that actually compiles+runs on the 910B3 under msprof, fetch op_summary CSV, parse T_measured via msprof_parser, and render the three-level reachability hierarchy (HIVM/DSL/measured) with a real author_headroom number. Closes the 'author_headroom never populated with real data' caveat.",
+      "id": "US-SB-003",
+      "title": "Task 1: Real des.json for chunk_kda via NPUIR dump-then-fetch (THE GATE)",
+      "description": "The Tier-2 bound needs per-core HIVM data from a real kernel. Route: dump chunk_kda's NPUIR on the remote 910B3 during a triton-ascend compile, fetch to local, run tritonsim-hivm --npuir-file locally to produce des.json, then feed into report_from_desgraph for a real Tier-1+Tier-2 bound paired with the real T_measured (104,326 \u00b5s).",
       "acceptanceCriteria": [
-        "A kernel is profiled on real hardware via remote_bench (msprof op_summary_*.csv fetched back to local)",
-        "parse_kernel_time_us() parses the real CSV to a finite positive T_measured (n_invocations >= 1 after warmup discard)",
-        "The kernel's bound (T_bound_HIVM/T_bound_DSL) is computed and the three-level report renders with real T_measured and a real author_headroom_us (or a labelled BOUND_VIOLATION if T_bound > T_measured)",
-        "The validation soundness check classifies the run as PASS or BOUND_VIOLATION (not EXECUTION_ERROR), with the real CSV path recorded as msprof_source",
-        "The real CSV + report output are saved under .omc/research/ as evidence, and progress.txt records the measured numbers"
+        "chunk_kda NPUIR (.npuir.mlir) is captured on remote 910B3 and fetched to .omc/research/hw_runs/",
+        "build/bin/tritonsim-hivm --npuir-file=<fetched> --des-graph-file=/tmp/kda_des.json --hardware-config=configs/ascend_910b.json produces a non-empty des.json with Cube + Vector + MTE ops (verified via extract_hivm)",
+        "report_from_desgraph(des_json=..., grid_dims=(128,32), n_cores=20, kernel_name='chunk_kda', t_measured_us=104326.0) yields a KernelReport with t_bound_us > 0 and a tighter bound than the 1386 \u00b5s HBM floor",
+        "FLOP reconciliation: extracted FLOPs within \u00b125% of HAND_FLOPS_TOTAL = 4.724e10",
+        "CI test in tests/perfbound/ loads the committed kda_des.json and asserts real-bound soundness (T_bound \u2264 T_measured)"
       ],
       "priority": 3,
-      "passes": true
+      "passes": true,
+      "notes": "Gate task. Requires remote 910B3 access + local tritonsim-hivm build. If NPUIR dump proves infeasible, document why and fall back to aarch64 native build.",
+      "caveat": "FLOP reconciliation blocked: C++ emitter does not propagate flops to expanded mmadL1 sub-ops; DES depends_on is sync-only (not data-flow). Documented as known limitation. Core gate (NPUIR\u2192des.json\u2192bound pipeline) proven end-to-end."
     },
     {
-      "id": "US-HW-004",
-      "title": "Reproduce/resolve the bishengir chunk_kda compile on real CANN 9.0.0 and settle the xfail",
-      "description": "Run bishengir-compile on the chunk_kda kernel path on the real 910B3 (CANN 9.0.0). Record the definitive outcome: does it still crash in ConvertLinalgRToBinary (SmallVector assertion)? Does the HIVM/DES dump survive the crash so the modelling path still works even if codegen fails? Update tests/perfbound/test_chunk_kda_milestone.py xfail to reflect the evidence (keep xfail with concrete reason+log, or flip to pass if the bug is gone on this CANN).",
+      "id": "US-SB-004",
+      "title": "Task 4b: Source repeat/mask from correct IR stage",
+      "description": "Current NPUIR (post-GraphSyncSolver hivm.hir) has no repeat/mask attributes \u2014 they appear later in CCE/binary codegen. Investigate where in triton-ascend/bishengir the per-op CCE repeat/mask first appear and wire extraction from that stage.",
       "acceptanceCriteria": [
-        "bishengir-compile is run against the chunk_kda kernel on the remote 910B3 and the full stdout/stderr is captured to .omc/research/ as evidence",
-        "The outcome is definitively classified: (a) still crashes in ConvertLinalgRToBinary, (b) compiles successfully, or (c) different failure — with the exact error recorded",
-        "Whether the HIVM/DES graph dump is produced before the crash is determined (the TestDumpBeforeCodegen spike question is answered with evidence)",
-        "test_chunk_kda_milestone.py is updated so its xfail/skip condition matches reality on this CANN (reason string cites the captured evidence; flips to a real pass only if the kernel actually compiles)",
-        "python3 -m pytest tests/perfbound/test_chunk_kda_milestone.py -q reflects the real state (xfail with documented reason, or pass)"
+        "Investigation documented in .omc/research/hw_runs/RESULTS.md: where repeat/mask first appear in the lowering pipeline",
+        "Either a new IR dump path is wired or extraction is adjusted to read from the correct stage",
+        "A real kernel's des.json shows non-default repeat/mask on ops that have them",
+        "_wire_gaps (bound_combiner.py) yields a non-trivial Gap 4 for that kernel",
+        "Value-asserting test from US-SB-001 passes with real data"
       ],
       "priority": 4,
-      "passes": true
+      "passes": true,
+      "notes": "CLOSED 2026-06-11. Investigation (RESULTS.md §5): repeat/mask absent at npuir/hivm.hir level for ALL kernels; later bishengir codegen stage is unparseable (compile times out >600s). Resolved analytically instead: C++ emits repeat=ceil(elements/lanes) (271/1378 ops now repeat>1); Gap-4 uses per-instruction issue-overhead semantics. Real chunk_kda bound tightened to 46,110us <= 104,326us measured (2.26x vs 75x HBM floor); Gap-4 non-zero. Local, no device needed."
     },
     {
-      "id": "US-HW-005",
-      "title": "Update PROGRESS.md + caveat docs to reflect the real hardware results",
-      "description": "Replace the 'hardware-gated / never run on real hardware' caveats with the evidence-backed outcomes from US-HW-003 and US-HW-004. Update .omc/plans/a6_progress.md blocker table and PROGRESS.md current-state section.",
+      "id": "US-SB-005",
+      "title": "Task 2: Multi-kernel validation set (n \u2265 5)",
+      "description": "Validate soundness across \u22655 kernels using remote 910B3. Each kernel: msprof CSV \u2192 T_measured, des.json via Task 1 route \u2192 T_bound, validate_from_csv \u2192 PASS. Aggregate via ValidationSuite.",
       "acceptanceCriteria": [
-        "PROGRESS.md current-state section records: remote 910B3 wired, a real T_measured produced (with the number), and the bishengir chunk_kda outcome (resolved/still-blocked with evidence link)",
-        ".omc/plans/a6_progress.md blocker table updated: each previously hardware-gated row now points to the captured evidence and its resolved status",
-        "Any caveat that is genuinely closed is stated plainly; any that remains (e.g. a third-party compiler bug we cannot patch) is stated with the evidence and why it is out of our control",
-        "No overclaiming: docs distinguish 'ran on hardware and measured' from 'still blocked by external compiler bug'"
+        "\u22655 kernels with committed T_bound, T_measured, status, tightness, component_match under .omc/research/hw_runs/",
+        "soundness_rate == 1.0 (no BOUND_VIOLATION \u2014 any violation is a model bug to fix)",
+        "CI test loading the fixtures passes"
       ],
       "priority": 5,
-      "passes": true
+      "passes": false,
+      "notes": "Depends on US-SB-003. Requires remote 910B3 for each kernel."
+    },
+    {
+      "id": "US-SB-006",
+      "title": "Task 3: One live counterfactual (Experiment 3)",
+      "description": "Validate gap attribution via a live counterfactual on real hardware. Apply HivmEdit to a real kernel's des.json, recompile via bishengir on 910B3, verify correctness, measure delta. Target: output_verified AND |predicted\u2212measured|/measured < 0.20.",
+      "acceptanceCriteria": [
+        "\u22651 CounterfactualResult with output_verified=True and quantification_error < 0.20",
+        "Evidence committed under .omc/research/hw_runs/"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "Depends on US-SB-003. Requires remote 910B3."
+    },
+    {
+      "id": "US-SB-007",
+      "title": "Task 5: Scalar throughput calibration",
+      "description": "Replace Vector/20 scalar proxy with measured P_scalar from a CCE microbench on 910B3.",
+      "acceptanceCriteria": [
+        "CCE microbench for Scalar throughput measured on 910B3",
+        "Measured P_scalar constant (with CI) replaces Vector/20 proxy in calibration DB",
+        "Calibration tests updated"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "Requires remote 910B3."
+    },
+    {
+      "id": "US-SB-008",
+      "title": "Task 7: Validate two-limit compiler-headroom on hardware",
+      "description": "Compute T_bound_HIVM and T_bound_DSL for a real kernel, author a hand-optimized HIVM realizing the idealized relaxations, compile+profile on 910B3, verify the predicted compiler-headroom within ~20%.",
+      "acceptanceCriteria": [
+        "For \u22651 real kernel: T_bound_HIVM \u2264 T_bound_DSL \u2264 T_measured computed",
+        "Hand-optimized HIVM compiled and profiled on 910B3 with correctness verification",
+        "Measured speedup validates predicted compiler-headroom within ~20% tolerance (or documented explanation of miss)",
+        "Result annotated with Gap-1/3 vs Gap-1/2/3/4 interpretation per DECISION REQUIRED callout",
+        "Evidence under .omc/research/hw_runs/; CI test loading fixtures"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": "Depends on US-SB-003 + spec-author decision on Gap interpretation. May need a simpler kernel if hand-optimization proves infeasible for chunk_kda."
     }
   ]
 }

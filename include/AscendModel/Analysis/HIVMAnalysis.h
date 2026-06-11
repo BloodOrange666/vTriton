@@ -68,6 +68,8 @@ struct HIVMOp {
   std::string srcSpace;  // e.g. "gm", "ub", "l1", "l0a", "l0b", "l0c"
   std::string dstSpace;  // destination memory space for transfer ops
   std::string elemType;  // element type: "f16", "bf16", "f32", "i32", etc.
+  int64_t repeat = 1;    // CCE repeat count (>1 = op iterates internally; Gap 4)
+  int64_t mask = 0;      // mask lanes disabled (0 = all lanes active; Gap 4)
   std::vector<std::string> readBuffers;
   std::vector<std::string> writeBuffers;
   std::vector<int64_t> readBufferVersions;
@@ -89,6 +91,7 @@ struct HIVMAnalysisReport {
   size_t barrierCount = 0;
   size_t unknownOpCount = 0;
   int64_t maxLoopMultiplier = 1;
+  bool scheduleTruncated = false; ///< true if DES scheduler hit maxIterations
   std::map<HIVMPipe, int64_t> pipeBusyCycles;
   std::map<HIVMPipe, int64_t> weightedPipeCycles;
   std::vector<HIVMOp> operations;
