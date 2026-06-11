@@ -63,12 +63,15 @@
   "n_kernels": 5,
   "target_n": 5,
   "remaining": [],
+  "satisfies_us_sb_005": false,
+  "us_sb_005_note": "Pilot evidence only. Five kernels with soundness_rate=1.0, but only chunk_kda uses a Tier-2 DES bound; vector_add contributes two shape variants (16M/32M) and four of five use the loose analytic HBM floor. Distinct-kernel diversity and Tier-2 coverage are insufficient to close US-SB-005.",
   "counterfactual": {
     "description": "US-SB-006: work-scaling counterfactual (vector_add N=16M vs N=32M)",
     "scaling_ratio": 1.9713,
     "predicted_ratio": 2.0,
     "quantification_error": 0.0295,
     "is_valid": true,
+    "satisfies_us_sb_006": false,
     "evidence": ".omc/research/hw_runs/counterfactual_results.json"
   },
   "two_limit": {
@@ -79,7 +82,9 @@
     "compiler_headroom_us": 44.99,
     "author_headroom_us": 58216.09,
     "gap_interpretation": "Gap-1/Gap-3 only (resolved by spec author 2026-06-11)",
-    "finding": "Compiler headroom is negligible (0.04% of measured). Author headroom dominates at 55.8%. bishengir's lowering is near-optimal for chunk_kda."
+    "finding": "Compiler headroom is negligible (0.04% of measured). Author headroom dominates at 55.8%. bishengir's lowering is near-optimal for chunk_kda.",
+    "satisfies_us_sb_008": false,
+    "us_sb_008_note": "Analytical-only feasibility result. chunk_kda's predicted compiler headroom (44.99us) is below measurement noise, so no equivalent hand-optimized HIVM was compiled/profiled to validate reachability. US-SB-008 requires hardware validation on a kernel with measurable compiler headroom."
   },
   "scalar_calibration": {
     "description": "US-SB-007: derived scalar throughput from measured vector + SIMD width",
@@ -87,6 +92,8 @@
     "p_vector_gflops": 15.133,
     "ratio": "vector/128",
     "methodology": "Derived: scalar ALU processes 1 elem/cycle vs vector SIMD 128/cycle; per-instruction overhead identical",
-    "source": "derived_from_vector_microbench"
+    "source": "derived_from_vector_microbench",
+    "satisfies_us_sb_007": false,
+    "us_sb_007_note": "Derived (Vector/128), NOT a direct CCE scalar measurement. US-SB-007 requires a measured P_scalar from a CCE microbench on 910B3."
   }
 }
