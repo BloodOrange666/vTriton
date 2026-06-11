@@ -1,0 +1,31 @@
+{
+  "description": "US-SB-005 multi-kernel soundness validation set (real 910B3 msprof). soundness_rate must stay 1.0 (any BOUND_VIOLATION is a model bug). component_match=false where msprof attributes the whole MIX_AIC duration to aicore so a memory-bound kernel still profiles aicore-dominant (known limitation, not a soundness failure).",
+  "kernels": [
+    {
+      "kernel": "chunk_kda",
+      "bound_kind": "tier2_des",
+      "t_bound_us": 46109.91,
+      "t_measured_us": 104326.0,
+      "status": "PASS",
+      "tightness": 2.26,
+      "component_match": false,
+      "fixture": "tests/perfbound/fixtures/chunk_kda_op_summary_910b3.csv",
+      "des": ".omc/research/hw_runs/kda_des.json"
+    },
+    {
+      "kernel": "vector_add",
+      "bound_kind": "analytic_hbm_floor",
+      "t_bound_us": 125.83,
+      "t_measured_us": 309.55,
+      "status": "PASS",
+      "tightness": 2.46,
+      "component_match": false,
+      "fixture": "tests/perfbound/fixtures/vector_add_op_summary_910b3.csv",
+      "harness": "test/vector_add_bench.py"
+    }
+  ],
+  "soundness_rate": 1.0,
+  "n_kernels": 2,
+  "target_n": 5,
+  "remaining": ["softmax", "layernorm", "one more (e.g. matmul or rmsnorm)"]
+}
