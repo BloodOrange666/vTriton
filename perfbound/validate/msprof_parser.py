@@ -251,7 +251,8 @@ class EngineAttribution(NamedTuple):
     aiv_time_us: float
     aic_time_us: float
     scalar_us: float
-    scalar_frac: float            # scalar_us / t_measured_us
+    scalar_frac: float            # scalar_us / t_measured_us (blended AIV+AIC, dominance display)
+    aiv_scalar_frac: float        # scalar(AIV) / aiv_time_us (same-core, for Gap-OVL pts)
     dominant_engine: str
     icache_miss: tuple[float, float]   # (aic, aiv)
     cube_util_pct: float
@@ -343,6 +344,13 @@ def parse_engine_attribution(
 
     scalar_us = engine_us.get("scalar (AIV)", 0.0) + engine_us.get("scalar (AIC)", 0.0)
     scalar_frac = scalar_us / t if t and not math.isnan(t) else 0.0
+    # Same-core scalar share: scalar(AIV) over the AIV core's own busy time.
+    # This is the apples-to-apples counterpart to the DES schedule's
+    # critical-path exposed-control fraction (both normalize to one core's
+    # timeline), and is what Gap-OVL subtracts.  scalar_frac (blended over
+    # wall-clock) is kept only for the dominance display.
+    aiv_scalar_us = engine_us.get("scalar (AIV)", 0.0)
+    aiv_scalar_frac = aiv_scalar_us / aiv if aiv and not math.isnan(aiv) else 0.0
     dominant = max(engine_us, key=engine_us.get) if engine_us else ""
 
     return EngineAttribution(
@@ -352,6 +360,7 @@ def parse_engine_attribution(
         aic_time_us=aic,
         scalar_us=scalar_us,
         scalar_frac=scalar_frac,
+        aiv_scalar_frac=aiv_scalar_frac,
         dominant_engine=dominant,
         icache_miss=(_ffloat(row.get("aic_icache_miss_rate")),
                      _ffloat(row.get("aiv_icache_miss_rate"))),

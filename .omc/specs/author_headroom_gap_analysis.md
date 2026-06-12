@@ -1,19 +1,18 @@
 # Author Headroom Gap Analysis: Decomposing the T_measured − T_bound Gap
 
-**Status**: Research complete (v2 — evidence-led rewrite), spec for implementation
+**Status**: Research complete (v3 — Gap-OVL wiring), spec for implementation
 **Date**: 2026-06-12
 **Kernel**: `chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2` (bf16 fused attention backward)
 **Hardware**: Ascend 910B3, 20 AI Cores
 
-> **v2 note.** The first draft (v1) decomposed author headroom into five new gap
-> dimensions (HBM contention, AIC-AIV dequant serialization, instruction overlap,
-> hardware/cache residual, wave quantization) whose magnitudes were imported from
-> W4A16 / MatMul literature. When those estimates are checked against the data
-> that is *already present* in the msprof CSV and the DES graph, **four of the
-> five are refuted for this kernel** and the dominant cause — unmodeled **scalar**
-> cost — was missing entirely. v2 rewrites §0–§6 around what the two inputs
-> actually show. The prototype that produced these numbers is
-> `scripts/component_attribution_prototype.py`.
+> **v3 note.** v2 (retracted) attributed the dominant author headroom to
+> "Unmodeled Scalar Cost" and proposed US-SB-007 scalar calibration as the fix.
+> v3 corrects this: the scalar dominance is *exposed control + synchronization
+> overhead* — pipeline/overlap inefficiency — not scalar arithmetic.  The DES
+> schedule assumes ~6× overlap of control with compute (model exposed 11.9%);
+> hardware serializes it (measured 84.5% scalar).  This is the **Gap-OVL**
+> (Exposed Control/Sync Overlap Deficit).  v2's scalar-calibration conclusion
+> is retracted; Gap-OVL is the dominant mechanism.
 
 ---
 
@@ -30,48 +29,57 @@ Author headroom = 58,216 µs   (55.8% of T_measured)
 
 The 5-gap attribution covers only 2.73% of T_bound, so the headroom looks like a
 monolithic unknown. **It is not.** The msprof op-summary CSV carries per-engine
-busy ratios, and the DES graph carries per-pipe structural busy time. Read
-together they give a direct, quantified answer: **the kernel is scalar-bound, and
-the model does not price scalar work.**
+busy ratios, and the DES graph carries per-pipe structural busy time plus a
+schedule timeline. Read together they give a direct, quantified answer: **the
+kernel's headroom is dominated by exposed control/sync overlap deficit.**
 
 **Question answered:** *Can author headroom be analyzed from msprof + HIVM IR?*
 **Yes** — for this kernel class it decomposes cleanly, and it is dominated by a
-single, fixable cause rather than a spread of microarchitectural effects.
+single, fixable cause: the schedule over-assumes overlap of control with compute.
 
 ---
 
-## 1. Key Finding: The Headroom Is Unmodeled Scalar Cost
+## 1. Key Finding: The Headroom Is Exposed Control/Sync Overlap Deficit (Gap-OVL)
 
-Two independent inputs are read separately and **agree on the dominant engine**:
+Three facts, each independently verifiable from the DES graph + msprof:
+
+1. **0 of 597 `PIPE_S` ops are vectorizable** (none have `elements > 1`).  There
+   is no VEC→scalar fallback.  The PIPE_S ops are shape metadata
+   (`collapse_shape`, `subview`, `reinterpret_cast` ≈ 225), address/index
+   arithmetic (`index_cast`, `apply`, `muli`, `addi`, `min`, `max`, `cmpi`, …
+   ≈ 300), `alloc_workspace`, and loads.  Each is priced at **1 cycle** in the
+   model (585/597 = 1 cyc).
+
+2. **402 synchronization ops**: `set_flag` 116, `wait_flag` 110, `pipe_barrier`
+   80, `sync_block_wait` 48, `sync_block_set` 48 — also priced ~1 cycle.
+
+3. **Schedule overlap walk**: sweeping the DES schedule timeline shows
+   control/sync is 76.4% of structural busy, but the schedule overlaps it down
+   to **11.9% exposed** on the critical path (assumes ~6× overlap).  msprof
+   shows scalar is **84.5%** of wall-clock.  The hardware does **not** achieve
+   the modeled overlap.
+
+**Retraction of v2 conclusion.** v2 labeled this as "Unmodeled Scalar Cost" and
+proposed US-SB-007 (calibrate scalar throughput, add a scalar floor to the
+bound).  That conclusion was wrong: the scalar dominance is *exposed control +
+sync overhead* — a pipeline-overlap inefficiency — not scalar arithmetic and not
+VEC→scalar fallback.  v2 mislabeled this as scalar compute; it is overlap
+deficit.  US-SB-007 scalar calibration is retired as the primary fix.
+
+**Two independent inputs agree on the mechanism:**
 
 | Input | Signal | Scalar share |
 |-------|--------|--------------|
-| msprof (measured) | `aiv_scalar_ratio` × aiv_time + `aic_scalar_ratio` × aic_time | **91.6% of T_measured** (95,525 µs) |
-| HIVM/DES (structural) | Σ `duration·loop_multiplier` over `PIPE_S` ops | **72.7% of structural busy** (597 ops) |
+| msprof (measured, **same-core**) | `aiv_scalar_ratio` = scalar(AIV) / aiv_time | **84.5% of AIV core time** ← Gap-OVL term |
+| msprof (measured, blended) | (scalar AIV + scalar AIC) / T_measured | 91.6% of T_measured (95,525 µs) — *context only* |
+| HIVM/DES (structural) | Σ `duration·loop_multiplier` over `PIPE_S` ops | 72.7% of structural busy (597 ops) |
 
-Measured scalar time alone (**95,525 µs**) is **2.07× the entire bound**
-(46,110 µs). No combination of memory/compute-engine effects can explain the gap
-when scalar is 9/10ths of the measured execution.
-
-**Why the bound misses it.** `compute_component_floor` models the scalar pipe at
-the *full vector throughput* as a deliberate soundness fallback, because scalar
-was never directly calibrated:
-
-- `perfbound/model/component_model.py:290` — *"Without real Scalar calibration,
-  use Vector/20 as a conservative proxy"* — and the proxy is further relaxed to
-  the full Vector rate at:
-- `perfbound/calibration/constants.py:252` (`get_scalar_throughput_ops_per_us`) —
-  returns the measured Vector rate unless `scalar_throughput_measured` is True.
-
-Modeling scalar at vector SIMD speed makes the scalar floor ~two orders of
-magnitude too low, so the bound binds on **vector** (per §2.1) and the real scalar
-cost reappears downstream as "author headroom."
-
-**Consequence for the taxonomy.** Most of this 58,216 µs is **model headroom**,
-not author headroom: it is closed by *calibrating the scalar pipe and adding a
-scalar floor to the bound* (the still-open **US-SB-007**), which raises T_bound
-toward T_measured. It is not closed by the kernel author writing different Triton.
-Calling the whole 55.8% "author headroom" mislabels the cause.
+The DES schedule overlap walk reduces structural 72.7% to model-exposed 11.9%
+on the critical path; the **same-core** measured 84.5% scalar shows the hardware
+does not achieve this overlap.  **Gap-OVL subtracts matched denominators**
+(both normalize to one core's timeline): `84.5% − 11.9% = +72.6 pts`.  The
+blended 91.6% (scalar over wall-clock, across AIV+AIC) is a *different*
+denominator and is reported for context only, never as the Gap-OVL pts.
 
 ---
 
@@ -87,15 +95,16 @@ Calling the whole 55.8% "author headroom" mislabels the cause.
 | Tightness | 2.26× |
 | Soundness | PASS ✓ (T_bound ≤ T_measured) |
 | Binding tier | component |
-| Binding component | vector  ← *should be scalar; see §1* |
+| Binding component | vector  ← *should reflect scalar dominance via Gap-OVL* |
 | T_grid_floor | 46,064.92 µs |
 | T_core_floor | 46,109.91 µs |
 | T_serial_irreducible | 0.0000 µs |
 
-### 2.2 Component Attribution (NEW — from msprof + DES, not estimated)
+### 2.2 Component Attribution (from msprof + DES schedule overlap walk)
 
-Produced by `scripts/component_attribution_prototype.py`. Engine-time =
-(core busy time) × (that engine's msprof ratio).
+Produced by `attribute_by_component()` in `bound_combiner.py` + the schedule
+overlap walker `_schedule_overlap()`.  Engine-time = (core busy time) × (that
+engine's msprof ratio).
 
 **[1] msprof MEASURED engine-time** (where the hardware spent time):
 
@@ -110,7 +119,7 @@ Produced by `scripts/component_attribution_prototype.py`. Engine-time =
 | mte3-store (AIV) | 1,145 | 1.1% |
 | mte1 (AIC) | 832 | 0.8% |
 | mac-cube (AIC) | 624 | 0.6% |
-| **scalar total** | **95,525** | **91.6% of T_measured** |
+| **scalar total** | **95,525** | **91.6% of T_measured** (blended AIV+AIC over wall-clock — context only; Gap-OVL uses same-core 84.5%) |
 
 Side facts: `aic_icache_miss_rate = aiv_icache_miss_rate = 0.0` (not a cache
 problem); `cube_utilization = 99.6%` while `aic_mac_ratio = 0.006` (cube is
@@ -131,9 +140,14 @@ problem); `cube_utilization = 99.6%` while `aic_mac_ratio = 0.006` (cube is
 | PIPE_MTE1 | 19 | 0.6 | 0.4% |
 | PIPE_UNKNOWN | 190 | 0.0 | 0.0% |
 
-Both views rank scalar #1 by a wide margin. The structural share (72.7%) is lower
-than measured (91.6%) precisely because the model under-prices each scalar op
-(`duration` is often 1 cycle) — the residual is the scalar-calibration gap.
+**[3] Schedule overlap walk** (Gap-OVL structural primitives):
+
+| Metric | Value |
+|--------|-------|
+| Critical path | 10,055 cycles |
+| Exposed control (no compute/memory overlap) | 11.9% of critical path |
+| Control overlapped with compute/memory | remaining control cycles |
+| Sync/barrier ops | 402 |
 
 ### 2.3 Two-Limit Analysis
 
@@ -154,29 +168,38 @@ PIPE_M 32, PIPE_MTE1 19. Ops with repeat>1: 271 (min 8, max 64, median 32).
 
 ---
 
-## 3. Headroom Decomposition (evidence-led)
+## 3. Headroom Decomposition (evidence-led, v3)
 
-Gaps are ordered by what the data supports, with v1's literature gaps demoted to
-their measured magnitude.
+Gaps are ordered by what the data supports.
 
-### Gap-S: Unmodeled Scalar Cost — **DOMINANT**
+### Gap-OVL: Exposed Control/Sync Overlap Deficit — **DOMINANT**
 
-**Evidence**: msprof `scalar` = 91.6% of T_measured (95,525 µs); DES `PIPE_S` =
-72.7% of structural busy (597 ops). Bound models scalar at vector rate
-(component_model.py:290, constants.py:252).
+**Evidence**: Schedule overlap walk shows model exposes 11.9% control on the
+critical path; msprof shows 84.5% scalar in wall-clock.  Gap-OVL = +72.6 pts
+(≈ 58,216 µs, capped at author headroom).
 
-**What it measures**: the gap between real scalar-pipe time and the bound's
-(near-zero) scalar floor. Scalar ops here are address arithmetic, loop/index
-control, and per-tile setup that the AIV scalar unit executes serially.
+**What it measures**: the gap between the DES schedule's *assumed* overlap of
+control/sync with compute/memory, and the *realized* serialization on hardware.
+The model prices each control op at ~1 cycle and assumes the scalar unit
+overlaps the vector/cube units; the hardware serializes scalar address math,
+flag ops, and barriers.
 
-**How to extract** (no new hardware): scalar floor from DES =
-Σ_{PIPE_S} cycles · *calibrated* scalar cost; compare to msprof scalar engine-time
-to validate. The fix is **US-SB-007**: replace the vector-rate fallback with a
-measured CCE scalar rate, set `scalar_throughput_measured = True`, and let the
-scalar floor enter `max(...)` in the core floor.
+**How to extract**: the schedule overlap walk (`_schedule_overlap` in
+`bound_combiner.py`) sweeps start/end_cycle events, classifying ops as
+control_sync / compute / memory, then computes exposed_control_cycles as the
+fraction of the critical path where control is active with no overlapping
+compute or memory.  Compared against msprof `aiv_scalar_ratio`.
 
-**Magnitude**: ~50,000–60,000 µs — i.e. essentially the entire author headroom.
-Closing it tightens the bound, it does not change the kernel.
+**Metric** (denominator-honest):
+- Primary: `gap_ovl_pts = measured_scalar_frac − model_exposed_control_frac`
+  (points, not µs — the two fractions have different denominators).
+- Secondary: `gap_ovl_us = min(gap_ovl_pts × t_measured, author_headroom)` —
+  capped to never exceed the headroom it explains.
+
+**Magnitude**: ≈ 58,216 µs (the entire author headroom).
+
+**Action**: reduce sync density (multi-buffer), hoist address math out of the
+tile loop, fuse tiles to amortize control.  **Diagnostic only — bound unchanged.**
 
 ### Gap-E: Wave Quantization — small, structural, belongs in the grid floor
 
@@ -185,44 +208,39 @@ Closing it tightens the bound, it does not change the kernel.
 captures the average but not the last-wave tail.
 
 **Magnitude (its own formula)**: `(1 − 16/20)·T_core_floor / n_waves =
-0.2·46,110/205 ≈ 45 µs`. (v1 estimated 500–1,500 µs — ~10–30× its own formula;
-corrected here.) This belongs **inside** T_grid_floor, not in author headroom.
+0.2·46,110/205 ≈ 45 µs`. This belongs **inside** T_grid_floor, not in author
+headroom.
 
-### Gap-C: Instruction Overlap — plausible, needs calibration
+### Gap-C: Instruction Overlap — subsumed by Gap-OVL
 
-**Evidence**: Gap-3 (avoidable serialization) is a conservative upper bound; real
-hardware overlaps independent sub-ops. Genuine, but **not** derivable from
-msprof-aggregate + HIVM alone — it needs per-pipe overlap factors from
-microbenchmarks. Keep as a calibration item, not a quantified headroom bucket.
+**Evidence**: v2 described this as "plausible, needs calibration."  v3 notes
+that Gap-OVL *is* the quantified instruction-overlap deficit: the schedule
+overlap walk directly measures how much overlap the model assumed vs what
+hardware achieved.  Gap-C is subsumed by Gap-OVL and no longer a separate
+calibration item for this kernel class.
 
 ### Gap-A: HBM Bandwidth Contention — **refuted for this kernel**
 
 v1 estimate 9,000–17,000 µs (15–30%). Measured total MTE activity here is
 `aiv_mte2 0.019 + aic_mte2 0.026 + mte3 0.011 + mte1 0.008 ≈ 4.7%` (~7,600 µs).
 Contention cannot be 15–30% of headroom when *all* memory-engine activity is
-~4.7%. The 20–40% figure is from MatMul+weight-load (W4A16) kernels; chunk_kda is
-scalar-bound. **Drop for this kernel class**; revisit only for memory-bound MIX
-kernels.
+~4.7%. **Drop for this kernel class.**
 
 ### Gap-B: AIC-AIV Pipeline Serialization — **refuted for this kernel**
 
-v1 estimate 6,000–12,000 µs. Premised on cube→HBM→vector dequant round-trips. But
-`aic_mac_ratio = 0.006` — there is almost no cube MatMul, and `cube_utilization
-99.6%` with mac 0.6% means the cube is *idle-but-allocated*, not serialized
-through dequant. The W4A16 mechanism does not apply to this bf16 kernel.
-Structural PIPE_M→PIPE_V chain *counts* may still be reported, but no µs estimate
-is defensible here. **Drop for this kernel class.**
+v1 estimate 6,000–12,000 µs. `aic_mac_ratio = 0.006` — almost no cube MatMul.
+`cube_utilization 99.6%` with mac 0.6% means the cube is *idle-but-allocated*.
+**Drop for this kernel class.**
 
-### Gap-D: Hardware-Level Residual — keep, but small and renamed
+### Gap-D: Hardware-Level Residual — keep, but small
 
-Honest catch-all = `T_measured − T_bound(after Gap-S) − Gap-C − Gap-E`. Note
-`icache_miss_rate = 0.0` directly refutes the "cache behavior" content named in
-v1's rationale. Once Gap-S is priced into the bound, this residual is expected to
-be small.
+Honest catch-all = `T_measured − T_bound(after Gap-OVL) − Gap-E`.
+`icache_miss_rate = 0.0`. Once Gap-OVL is diagnosed, this residual is expected
+to be small.
 
 ---
 
-## 4. Estimated Headroom Decomposition (corrected)
+## 4. Estimated Headroom Decomposition (v3, corrected)
 
 ```
 T_measured (104,326 µs)
@@ -232,21 +250,19 @@ T_measured (104,326 µs)
 │     └── model core (44,853 µs)
 │
 └── Author headroom (58,216 µs = 55.8%)
-      ├── Gap-S  Unmodeled scalar cost      ~50,000–60,000 µs   (DOMINANT; = US-SB-007)
-      ├── Gap-C  Instruction overlap         (needs microbench calibration)
-      ├── Gap-D  Hardware residual           small once Gap-S is priced
-      ├── Gap-E  Wave quantization           ~45 µs (belongs in grid floor)
-      ├── Gap-A  HBM contention              refuted (~7,600 µs total MTE; not 9–17k)
-      └── Gap-B  AIC-AIV dequant serial      refuted (aic_mac 0.6%; mechanism absent)
+      ├── Gap-OVL Exposed control/sync overlap  ≈ 58,216 µs  (DOMINANT; +72.6 pts)
+      ├── Gap-E  Wave quantization              ~45 µs (belongs in grid floor)
+      ├── Gap-D  Hardware residual              small once Gap-OVL is diagnosed
+      ├── Gap-A  HBM contention                 refuted (~7,600 µs total MTE)
+      └── Gap-B  AIC-AIV dequant serial         refuted (aic_mac 0.6%; absent)
 ```
 
-The honest one-line decomposition: **author headroom ≈ Gap-S (unmodeled scalar) +
-a small residual.** Everything else is either tiny, refuted, or belongs in the
-bound.
+The honest one-line decomposition: **author headroom ≈ Gap-OVL (exposed
+control/sync overlap deficit) + a small residual.**
 
 ---
 
-## 5. Data Availability Matrix (corrected)
+## 5. Data Availability Matrix
 
 | Data | Available? | Location |
 |------|-----------|----------|
@@ -254,44 +270,37 @@ bound.
 | DES dependency edges | ✅ | kda_des.json `depends_on` |
 | Pipe assignment per op | ✅ | kda_des.json `pipe` (PIPE_S = 597) |
 | Per-pipe structural busy | ✅ | Σ `duration·loop_multiplier` |
-| **msprof per-engine ratios** | ✅ | `aiv_scalar_ratio`, `aiv_vec_ratio`, `aic_*_ratio` — **populated for the MIX_AIC kernel row** |
+| **Schedule timeline (start/end_cycle)** | ✅ | kda_des.json per-op fields |
+| **msprof per-engine ratios** | ✅ | `aiv_scalar_ratio`, `aiv_vec_ratio`, `aic_*_ratio` |
 | **msprof icache miss rate** | ✅ | `aic/aiv_icache_miss_rate` (= 0.0 here) |
 | Cube utilization | ✅ | `cube_utilization(%)` |
 | Per-core execution timeline | ❌ | Not in msprof aggregate |
 | Cache miss *penalty* (cycles) | ❌ | Only miss-rate exposed |
 | Per-wave timing | ❌ | Not in msprof aggregate |
 
-> **Correction to v1.** v1 stated msprof "only extracts aggregate task duration."
-> That describes the *current parser*, not the data: the CSV has per-engine ratios
-> and icache rates. The limitation is in parsing, not availability.
-
-> **Scope caveat (updated after implementation).** Per-engine ratios are
-> populated for the chunk_kda **MIX_AIC** row *and* for the **AI_VECTOR_CORE**
-> rows of softmax / layernorm / rmsnorm. The method generalises across both task
-> types; `parse_engine_attribution` returns `populated=False` only when the
-> matched row genuinely lacks ratio columns (e.g. vector_add's captured CSV has
-> no populated AI-core row). A per-row populated-field check is built in.
+> **Scope caveat.** Per-engine ratios are populated for the chunk_kda
+> **MIX_AIC** row and for the **AI_VECTOR_CORE** rows of softmax / layernorm /
+> rmsnorm.  The method generalises across both task types.
 >
 > **Scalar dominance is pervasive, not chunk_kda-specific.** Measured scalar
 > share across the committed fixtures: chunk_kda **0.85**, rmsnorm **0.69**,
 > softmax **0.51**, layernorm **0.47** — scalar is the dominant engine in every
-> populated kernel. This makes **US-SB-007 (scalar calibration) the single
-> highest-leverage model fix for the entire validation set**, not a one-kernel
-> patch.
+> populated kernel.  The Gap-OVL diagnosis applies wherever the schedule
+> over-assumes overlap.
 
 ---
 
-## 6. Implementation Roadmap (reprioritized)
+## 6. Implementation Roadmap (v3, reprioritized)
 
 | Phase | Component | Effort | Why |
 |-------|-----------|--------|-----|
-| **P0** | **US-SB-007 scalar calibration → scalar floor in bound** | (HW) | Closes ~the entire headroom; both inputs agree it is the cause |
-| **P0** | Promote `component_attribution_prototype.py` → `_attribute_by_component` in `bound_combiner.py`; surface in `report.py` | 3 hr | Turns headroom into a per-engine table from real data |
+| **P0** | **Wire Gap-OVL diagnostic into bound_combiner + report** | DONE ✅ | Turns headroom into a quantified overlap deficit |
+| **P0** | Reduce-sync-density recommendation surfaced in report | DONE ✅ | Actionable guidance for kernel authors |
 | **P1** | Fix binding-component reporting so scalar can bind once calibrated | 1 hr | §2.1 currently mis-binds vector |
 | **P2** | Gap-E wave-quant term folded into `grid_model.py` floor (~45 µs) | 1 hr | Structural; move out of "headroom" |
-| **P2** | Gap-C overlap factor (needs microbench) | 4 hr | Only real remaining model item |
-| **P3** | Gap-D residual bucket | 1 hr | Named remainder after Gap-S/C/E |
-| ~~—~~ | ~~Gap-A HBM contention, Gap-B AIC-AIV serial~~ | — | Refuted for this kernel class; do not implement on chunk_kda |
+| **P3** | Gap-D residual bucket | 1 hr | Named remainder after Gap-OVL/E |
+| ~~—~~ | ~~Gap-A HBM contention, Gap-B AIC-AIV serial~~ | — | Refuted for this kernel class |
+| ~~—~~ | ~~US-SB-007 scalar calibration~~ | — | **Retired**: scalar dominance is overlap deficit, not throughput |
 
 ---
 
@@ -305,28 +314,31 @@ bound.
 | msprof exposes only aggregate task duration | CSV has per-engine ratios + icache rates (parser limitation, not data) |
 | Cache behavior drives the residual (Gap-D content) | `icache_miss_rate = 0.0` |
 | Wave quantization is 500–1,500 µs (Gap-E v1) | Its own formula gives ~45 µs |
-| Author headroom is mostly "author" inefficiency | ~entire gap is unmodeled scalar = bound looseness (model headroom) |
+| **v2: Headroom is unmodeled scalar cost (Gap-S / US-SB-007)** | Scalar dominance is *exposed control/sync overlap deficit*, not arithmetic; 0/597 ops are vectorizable; schedule walk proves overlap assumption |
 
 ---
 
 ## 8. Limitations & Open Questions
 
-1. **The bound under-prices scalar by design.** Gap-S is closed by US-SB-007
-   (direct CCE scalar measurement); until then the bound stays loose but sound.
+1. **Gap-OVL is diagnostic only.** It does not change `t_bound_us`,
+   `t_core_floor_us`, or any soundness invariant.  The bound stays loose but
+   sound until a future overlap model is calibrated.
 
-2. **MIX_AIC vs simple kernels.** Component attribution is proven on the MIX_AIC
+2. **Denominator caveat.** `model_exposed_control_frac` is a fraction of the
+   idealized critical path; `measured_scalar_frac` is a fraction of wall-clock.
+   The primary metric (gap_ovl_pts, in points) is denominator-honest; the
+   secondary µs estimate is capped at author headroom.
+
+3. **MIX_AIC vs simple kernels.** Component attribution is proven on the MIX_AIC
    chunk_kda row; DSA_SQE/AI_VECTOR_CORE kernels need a populated-field check
    before the same method applies.
 
-3. **Overlap (Gap-C) and per-core variance** remain invisible to msprof-aggregate;
-   they need microbench calibration / per-core traces respectively.
+4. **Per-core variance** remains invisible to msprof-aggregate; it needs
+   per-core traces.
 
-4. **Counterfactual validation still blocked** — DES-JSON edits cannot be
-   recompiled; Gap-S is validated by *agreement of two independent inputs* rather
-   than by a hardware counterfactual.
-
-5. **structural vs measured scalar share** (72.7% vs 91.6%) is itself the
-   calibration signal — closing it is the US-SB-007 deliverable.
+5. **Counterfactual validation still blocked** — DES-JSON edits cannot be
+   recompiled; Gap-OVL is validated by *agreement of two independent inputs*
+   (schedule walk + msprof) rather than by a hardware counterfactual.
 
 ---
 
@@ -335,9 +347,10 @@ bound.
 | Source | Used for | Access |
 |--------|----------|--------|
 | `chunk_kda_op_summary.csv` (MIX_AIC row) | §1/§2.2 measured engine ratios | `.omc/research/hw_runs/` |
-| `kda_des.json` | §2.2 structural per-pipe busy | `.omc/research/hw_runs/` |
+| `kda_des.json` | §2.2 structural per-pipe busy + schedule timeline | `.omc/research/hw_runs/` |
 | `scripts/component_attribution_prototype.py` | reproduces all §1/§2.2 numbers | repo |
+| `scripts/overlap_walker_prototype.py` | validates schedule overlap walk (§2.2[3]) | repo |
+| `perfbound/combine/bound_combiner.py` | `_schedule_overlap`, `attribute_by_component` | codebase |
 | `perfbound/model/component_model.py:288–306` | scalar floor uses vector rate | codebase |
 | `perfbound/calibration/constants.py:252` | scalar-rate soundness fallback | codebase |
 | `perfbound/combine/two_limit.py` | author/compiler headroom defs | codebase |
-| RESULTS.md §8 (US-SB-007) | scalar calibration is the open item | `.omc/research/hw_runs/` |

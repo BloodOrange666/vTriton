@@ -196,8 +196,33 @@ class KernelReport:
                 sf = ca.get("measured_scalar_frac")
                 if sf is not None:
                     lines.append(f"  measured scalar share: {sf * 100:.1f}% of T_measured")
+            # Gap-OVL overlap line — same-core fractions (model critical-path
+            # exposed-control vs measured scalar share of AIV core time).
+            model_exp = ca.get("model_exposed_control_frac")
+            meas_sf = ca.get("measured_aiv_scalar_frac") or ca.get("measured_scalar_frac")
+            gap_pts = ca.get("gap_ovl_pts")
+            gap_us = ca.get("gap_ovl_us")
+            n_sync = ca.get("n_sync_ops")
+            ctrl_busy = ca.get("control_busy_frac")
+            if model_exp is not None and meas_sf is not None:
+                ovl_line = (
+                    f"  overlap: model exposes {model_exp * 100:.1f}% control (crit-path)"
+                    f" / measured {meas_sf * 100:.1f}% scalar (AIV core)"
+                )
+                if gap_pts is not None:
+                    ovl_line += f"  -> Gap-OVL {gap_pts * 100:+.1f} pts"
+                    if gap_us is not None:
+                        ovl_line += f" (≈ {gap_us:,.0f} µs, capped)"
+                lines.append(ovl_line)
+            if n_sync is not None and ctrl_busy is not None:
+                lines.append(
+                    f"  {n_sync} sync/barrier ops;"
+                    f" control/sync = {ctrl_busy * 100:.1f}% of structural busy"
+                )
             if ca.get("mis_binding"):
                 lines.append(f"  ** MIS-BINDING: {ca.get('note', '')}")
+            elif ca.get("note"):
+                lines.append(f"  note: {ca['note']}")
 
         return "\n".join(lines)
 
