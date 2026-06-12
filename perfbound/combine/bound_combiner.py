@@ -89,6 +89,134 @@ class Attribution:
         return max(gaps, key=lambda x: x[1])
 
 
+# Map raw DES pipe names to a coarse engine/component label, so the structural
+# split can be compared against msprof's measured engine split and the bound's
+# binding component.
+_PIPE_TO_ENGINE = {
+    "PIPE_S": "scalar",
+    "PIPE_V": "vector",
+    "PIPE_M": "cube",
+    "PIPE_MTE1": "mte",
+    "PIPE_MTE2_V": "mte",
+    "PIPE_MTE2_C": "mte",
+    "PIPE_MTE3": "mte",
+    "PIPE_FIX": "fixpipe",
+    "PIPE_ALL": "sync",
+    "PIPE_UNKNOWN": "unknown",
+}
+
+
+@dataclass
+class ComponentAttribution:
+    """Diagnostic decomposition of author headroom by execution engine (A.8).
+
+    Two independent views of where time goes, NEVER part of the bound:
+
+      * structural — HIVM/DES per-pipe busy (Σ duration·loop_multiplier),
+        clock-independent fractions.  This is what the model accounts for.
+      * measured   — msprof per-engine time (populated only for MIX_AIC-class
+        kernels whose ratio columns exist).  This is what the hardware did.
+
+    When both rank the same engine first and the bound binds a *different*
+    component, ``mis_binding`` is set: the bound under-prices the dominant
+    engine.  For chunk_kda this is scalar (the bound models scalar at the
+    vector rate — see component_model.py:290 / constants.py:252, US-SB-007).
+    """
+    structural_pipe_cycles: dict[str, int] = field(default_factory=dict)
+    structural_pipe_frac: dict[str, float] = field(default_factory=dict)
+    dominant_structural_pipe: str = ""
+    dominant_structural_engine: str = ""
+
+    measured_engine_us: Optional[dict[str, float]] = None
+    measured_scalar_frac: Optional[float] = None
+    dominant_measured_engine: Optional[str] = None
+
+    binding_component: Optional[str] = None
+    mis_binding: bool = False
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "structural_pipe_frac": self.structural_pipe_frac,
+            "dominant_structural_pipe": self.dominant_structural_pipe,
+            "dominant_structural_engine": self.dominant_structural_engine,
+            "measured_engine_us": self.measured_engine_us,
+            "measured_scalar_frac": self.measured_scalar_frac,
+            "dominant_measured_engine": self.dominant_measured_engine,
+            "binding_component": self.binding_component,
+            "mis_binding": self.mis_binding,
+            "note": self.note,
+        }
+
+
+def attribute_by_component(
+    extract: HIVMExtract,
+    binding_component: Optional[str] = None,
+    measured=None,
+) -> ComponentAttribution:
+    """Decompose author headroom by engine from DES structure + msprof (A.8).
+
+    Pure diagnostic — does not touch the bound.  Combines the HIVM structural
+    per-pipe busy split with, optionally, an ``EngineAttribution`` from msprof,
+    and flags when the bound binds a component other than the dominant engine.
+
+    Args:
+        extract: HIVM extract (uses op.pipe, duration_cycles, loop_multiplier).
+        binding_component: The bound's binding component value (e.g. "vector").
+        measured: Optional validate.msprof_parser.EngineAttribution.
+
+    Returns:
+        ComponentAttribution with structural + (optional) measured views.
+    """
+    cycles: dict[str, int] = {}
+    for op in extract.operations:
+        lm = op.loop_multiplier or 1
+        cycles[op.pipe] = cycles.get(op.pipe, 0) + op.duration_cycles * lm
+    total = sum(cycles.values())
+    frac = {p: (c / total if total else 0.0) for p, c in cycles.items()}
+    dom_pipe = max(cycles, key=cycles.get) if cycles else ""
+    dom_engine = _PIPE_TO_ENGINE.get(dom_pipe, dom_pipe)
+
+    ca = ComponentAttribution(
+        structural_pipe_cycles=cycles,
+        structural_pipe_frac=frac,
+        dominant_structural_pipe=dom_pipe,
+        dominant_structural_engine=dom_engine,
+        binding_component=binding_component,
+    )
+
+    measured_engine = None
+    if measured is not None and getattr(measured, "populated", False):
+        ca.measured_engine_us = dict(measured.engine_us)
+        ca.measured_scalar_frac = measured.scalar_frac
+        ca.dominant_measured_engine = measured.dominant_engine
+        # Collapse the measured engine label ("scalar (AIV)") to a bare engine.
+        measured_engine = measured.dominant_engine.split(" ")[0].lower()
+
+    # Mis-binding: the dominant engine (structural, corroborated by measured if
+    # present) differs from what the bound binds.
+    consensus_engine = measured_engine or dom_engine
+    if binding_component and consensus_engine and consensus_engine != binding_component.lower():
+        ca.mis_binding = True
+        note = (
+            f"Bound binds '{binding_component}' but the dominant engine is "
+            f"'{consensus_engine}' (structural {dom_engine} "
+            f"{frac.get(dom_pipe, 0.0) * 100:.0f}%"
+        )
+        if ca.measured_scalar_frac is not None:
+            note += f", measured scalar {ca.measured_scalar_frac * 100:.0f}%"
+        note += "). "
+        if consensus_engine == "scalar":
+            note += (
+                "Scalar is modeled at the vector rate (component_model.py:290, "
+                "constants.py:252) — most author headroom is unmodeled scalar "
+                "cost (model headroom); calibrate scalar (US-SB-007)."
+            )
+        ca.note = note
+
+    return ca
+
+
 @dataclass
 class BoundResult:
     """Final bound output for a single kernel."""

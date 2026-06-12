@@ -58,6 +58,10 @@ class KernelReport:
     # Attribution (five-way, fractions of T_bound)
     attribution: dict[str, float] = field(default_factory=dict)
 
+    # Author-headroom component attribution (A.8) — diagnostic, from
+    # bound_combiner.attribute_by_component().to_dict().  None until wired.
+    component_attribution: Optional[dict] = None
+
     # Recommendation
     recommended_action: str = "unknown"
 
@@ -75,6 +79,7 @@ class KernelReport:
             "compiler_headroom_us": self.compiler_headroom_us,
             "author_headroom_us": self.author_headroom_us,
             "attribution": self.attribution,
+            "component_attribution": self.component_attribution,
             "recommended_action": self.recommended_action,
         }
         # A.6.1 reachability block
@@ -174,6 +179,25 @@ class KernelReport:
 
         lines.append(f"")
         lines.append(f"Recommended action: {self.recommended_action}")
+
+        ca = self.component_attribution
+        if ca:
+            lines.append("")
+            lines.append("Author-Headroom Component Attribution (A.8 — diagnostic):")
+            struct = ca.get("structural_pipe_frac") or {}
+            for pipe, fr in sorted(struct.items(), key=lambda x: -x[1])[:5]:
+                if fr > 0:
+                    lines.append(f"  structural {pipe:14s} {fr * 100:5.1f}% of HIVM busy")
+            meas = ca.get("measured_engine_us")
+            if meas:
+                top = sorted(meas.items(), key=lambda x: -x[1])[:5]
+                for eng, us in top:
+                    lines.append(f"  measured   {eng:16s} {us:10.0f} us")
+                sf = ca.get("measured_scalar_frac")
+                if sf is not None:
+                    lines.append(f"  measured scalar share: {sf * 100:.1f}% of T_measured")
+            if ca.get("mis_binding"):
+                lines.append(f"  ** MIS-BINDING: {ca.get('note', '')}")
 
         return "\n".join(lines)
 

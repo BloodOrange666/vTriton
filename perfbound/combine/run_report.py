@@ -29,7 +29,7 @@ from ..extract.dsl_extractor import GridInfo
 from ..calibration.calib_loader import load_default_calib_db
 from ..calibration.constants import CalibrationDB
 from ..model.bounds import compute_bounds
-from .bound_combiner import combine, BoundResult
+from .bound_combiner import combine, BoundResult, attribute_by_component
 from .report import KernelReport
 from .two_limit import compute_two_limit, TwoLimitResult
 
@@ -115,7 +115,16 @@ def report_from_desgraph(
         total_programs=total_programs,
     )
 
-    return KernelReport.from_bound(result, two_limit=two_limit)
+    report = KernelReport.from_bound(result, two_limit=two_limit)
+
+    # A.8 author-headroom component attribution (structural view; the measured
+    # view is added later by the CSV bridge when an msprof CSV is supplied).
+    binding = result.binding_component.value if result.binding_component else None
+    report.component_attribution = attribute_by_component(
+        extract, binding_component=binding,
+    ).to_dict()
+
+    return report
 
 
 def report_from_npuir(
@@ -324,6 +333,44 @@ def _merge_validation_from_csv(
         # EXECUTION_ERROR: still set t_measured_us=None to signal failure
         import sys
         print(f"Warning: validation failed ({vr.notes})", file=sys.stderr)
+
+    # A.8: enrich the component attribution with the measured per-engine split
+    # (independent of timing validation status — the ratios always come from
+    # the same CSV row).
+    _merge_engine_attribution(report, csv_path, profiler_op_name)
+
+
+def _merge_engine_attribution(
+    report: KernelReport,
+    csv_path: str | Path,
+    profiler_op_name: str,
+) -> None:
+    """Add the msprof measured per-engine split into report.component_attribution.
+
+    The structural view is already attached by report_from_desgraph; this adds
+    the measured view and confirms mis-binding when the dominant measured engine
+    differs from the bound's binding component.  No-op when the CSV row lacks
+    per-engine ratios (populated=False).
+    """
+    from ..validate.msprof_parser import parse_engine_attribution
+
+    ea = parse_engine_attribution(csv_path, profiler_op_name)
+    if ea is None or not ea.populated:
+        return
+
+    ca = report.component_attribution or {}
+    ca["measured_engine_us"] = dict(ea.engine_us)
+    ca["measured_scalar_frac"] = ea.scalar_frac
+    ca["dominant_measured_engine"] = ea.dominant_engine
+
+    binding = ca.get("binding_component")
+    dom = ea.dominant_engine.split(" ")[0].lower()
+    if binding and dom and dom != binding.lower():
+        ca["mis_binding"] = True
+        if ca.get("note") and "measured" not in ca["note"]:
+            ca["note"] = (ca["note"].rstrip()
+                          + f" [measured {dom} {ea.scalar_frac * 100:.0f}% of T_measured]")
+    report.component_attribution = ca
 
 
 if __name__ == "__main__":
