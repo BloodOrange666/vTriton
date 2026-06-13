@@ -13,7 +13,7 @@ import argparse
 import csv
 import json
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +27,12 @@ from ..model.component_model import ComponentBound, compute_component_floor_from
 _EPSILON = 1e-12
 _COMPUTE_COMPONENTS = (Component.CUBE, Component.VECTOR, Component.SCALAR)
 _MTE_COMPONENTS = (Component.MTE_GM, Component.MTE_L1, Component.MTE_UB)
+
+# DES 调度时间线分类（用于量化暴露控制/同步赤字）。
+_OVL_COMPUTE = {"PIPE_V", "PIPE_M"}
+_OVL_MEMORY = {"PIPE_MTE2_V", "PIPE_MTE2_C", "PIPE_MTE3", "PIPE_MTE1", "PIPE_FIX"}
+_OVL_CONTROL = {"PIPE_S", "PIPE_ALL"}
+_SYNC_OPS = {"wait_flag", "set_flag", "pipe_barrier", "sync_block_wait", "sync_block_set"}
 
 
 @dataclass
@@ -112,6 +118,17 @@ class OperatorBottleneckReport:
     dominant_share: float
     component_results: dict[str, ComponentUtilization] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+
+    # —— 对论文的补充：暴露控制/同步赤字的量化 ——
+    # 仅当判定为 Insufficient Parallelism 且主导为暴露的 Scalar 控制时填充。
+    # 模型(DES 调度)假设控制能和计算重叠到 exposed_control_frac_model；硬件实测的
+    # 同核 scalar 占用 exposed_control_frac_measured 远高于它，差值即赤字（论文的
+    # 二分类只给定性结论，这里给定量）。diagnostic-only，不改变任何 bound。
+    exposed_control_frac_model: Optional[float] = None      # DES 关键路径暴露控制比例
+    exposed_control_frac_measured: Optional[float] = None   # 同核实测 scalar 占比 (aiv)
+    exposed_control_deficit_pts: Optional[float] = None     # measured - model（百分点/小数）
+    exposed_control_deficit_us: Optional[float] = None      # 估计 µs，封顶到 author headroom
+    n_sync_ops: Optional[int] = None
 
 
 def compute_realized_utilization(
@@ -285,21 +302,53 @@ def analyze_operator_bottleneck(
             warnings=warnings,
         )
 
-    if all(result.r_residency < r_threshold for result in valid):
+    # —— 对论文的补充：暴露的控制/同步开销 ——
+    # 论文的欠利用分类只有两类，且用 (∀R<threshold) 判定 Insufficient
+    # Parallelism。但这无法处理"某个高驻留 component 其实是暴露的控制/同步"的
+    # 情形：在 Ascend 上 Scalar 还负责向其他单元派发指令并插入 pipe_barrier，
+    # 这类 op 几乎没有算术/传输 work，却可能独占时间线。由于 work_done<=0，它
+    # 会被 valid 过滤排除，于是论文会把算子误判为 Inefficient Component（让你去
+    # 优化 scalar 的算术效率，方向错误）。我们补充：高驻留(R>=threshold)但无
+    # 算术/传输 work 的 component 视为暴露的控制/同步，归因为 Insufficient
+    # Parallelism（控制路径没能和计算重叠 = 并行不足），并把它标为主导 locus。
+    exposed_control = sorted(
+        (
+            result
+            for result in utilization.component_results.values()
+            if result.r_residency >= r_threshold and result.work_done <= 0
+        ),
+        key=lambda item: item.r_residency,
+        reverse=True,
+    )
+    top_valid_residency = max(
+        (result.r_residency for result in valid), default=0.0
+    )
+    valid_high_r = [result for result in valid if result.r_residency >= r_threshold]
+
+    if not valid_high_r or (
+        exposed_control and exposed_control[0].r_residency >= top_valid_residency
+    ):
+        locus = exposed_control[0] if exposed_control else None
+        ip_warnings = list(warnings)
+        if locus is not None:
+            ip_warnings.append(
+                f"{locus.component.value}: 高驻留 R={locus.r_residency:.2f} 但无算术/传输 "
+                "work，判定为暴露的控制/同步开销（exposed control/sync），归因为并行不足"
+            )
         return OperatorBottleneckReport(
             kernel_name=profile.kernel_name,
             elapsed_time_us=profile.elapsed_time_us,
             diagnosis="Insufficient Parallelism",
             bound_kind=None,
-            dominant_component=None,
-            dominant_item=None,
-            dominant_share=0.0,
+            dominant_component=locus.component if locus else None,
+            dominant_item=locus.dominant_item if locus else None,
+            dominant_share=locus.dominant_share if locus else 0.0,
             component_results=utilization.component_results,
-            warnings=warnings,
+            warnings=ip_warnings,
         )
 
     # 高 R 但低 E 的 component 是 Inefficient Component 的主要嫌疑。
-    high_r = [result for result in valid if result.r_residency >= r_threshold]
+    high_r = valid_high_r
     candidates = high_r if high_r else valid
     dominant = max(
         candidates,
@@ -381,6 +430,66 @@ def _dominant_breakdown_item(
     return dominant.label, dominant.work / total
 
 
+def _ovl_category(op) -> str:
+    """把一个 DES op 归类为 control_sync / compute / memory / other。
+
+    OpRecord 不带 is_sync/is_barrier，所以用 pipe + op_name 判定。
+    """
+    if op.op_name in _SYNC_OPS or op.pipe in _OVL_CONTROL:
+        return "control_sync"
+    if op.pipe in _OVL_COMPUTE:
+        return "compute"
+    if op.pipe in _OVL_MEMORY:
+        return "memory"
+    return "other"
+
+
+def _exposed_control_overlap(operations) -> tuple[float, int, int]:
+    """扫描 DES 调度，计算"模型预测的暴露控制比例"。
+
+    对 start_cycle/end_cycle 做 +1/-1 扫描，统计 control_sync 活跃且**没有**任何
+    compute/memory 重叠的周期，占关键路径的比例。这是模型假设的控制暴露下界——
+    硬件实测的同核 scalar 占用远高于它，差值即暴露控制/同步赤字。
+
+    返回 (model_exposed_frac, n_sync_ops, critical_path_cycles)；调度退化时返回 0。
+    """
+    n_sync = sum(1 for op in operations if op.op_name in _SYNC_OPS)
+    if not operations:
+        return 0.0, n_sync, 0
+    critical_path = max(op.end_cycle for op in operations)
+    if critical_path <= 0:
+        return 0.0, n_sync, 0
+
+    events: dict[int, Counter] = defaultdict(Counter)
+    for op in operations:
+        start, end = op.start_cycle, op.end_cycle
+        if end <= start:
+            continue
+        cat = _ovl_category(op)
+        if cat == "other":
+            continue
+        events[start][cat] += 1
+        events[end][cat] -= 1
+
+    active: Counter = Counter()
+    state_cycles: Counter = Counter()
+    prev = None
+    for t in sorted(events):
+        if prev is not None and t > prev:
+            cats = frozenset(c for c, n in active.items() if n > 0)
+            state_cycles[cats] += t - prev
+        for cat, delta in events[t].items():
+            active[cat] += delta
+        prev = t
+
+    exposed = sum(
+        cyc
+        for cats, cyc in state_cycles.items()
+        if "control_sync" in cats and "compute" not in cats and "memory" not in cats
+    )
+    return exposed / critical_path, n_sync, critical_path
+
+
 def run_from_files(
     op_summary_path: str | Path,
     desgraph_path: str | Path,
@@ -390,8 +499,17 @@ def run_from_files(
     u_threshold: float = 0.80,
     r_threshold: float = 0.50,
     work_tolerance: float = 0.10,
+    t_bound_us: float | None = None,
 ) -> OperatorBottleneckReport:
-    """从 op_summary、DES graph 和 calibration 文件端到端运行分析。"""
+    """从 op_summary、DES graph 和 calibration 文件端到端运行分析。
+
+    ``t_bound_us`` 是该 kernel 的 sound 紧 bound（loop-scaled 两级调度 bound，
+    例如 46,109.91 µs），仅用于把暴露控制/同步赤字的 µs 估计封顶到 author
+    headroom (elapsed - t_bound_us)。注意：本模块自身的 component throughput
+    floor（compute_component_floor）只是吞吐下界，对 chunk_kda 这类非吞吐受限的
+    kernel 过松（~225 µs），不能用作 author headroom 的基准；DES 原始 makespan
+    又是 per-iteration（未 loop 放大）。因此紧 bound 必须由调用方提供，不提供时
+    deficit_pts 仍给出（与分母无关），但 deficit_us 留空。"""
 
     op_row = _read_op_summary_row(op_summary_path, kernel_name)
     profile_name = kernel_name or _cell(op_row, "Op Name", "op_name", "Name") or "unknown"
@@ -469,13 +587,39 @@ def run_from_files(
         elapsed_time_us=elapsed_time_us,
         components=components,
     )
-    return analyze_operator_bottleneck(
+    report = analyze_operator_bottleneck(
         profile,
         component_bound,
         u_threshold=u_threshold,
         r_threshold=r_threshold,
         work_tolerance=work_tolerance,
     )
+
+    # —— 对论文的补充：量化暴露控制/同步赤字 ——
+    # 当判定为暴露的 Scalar 控制导致的 Insufficient Parallelism 时，用 DES 调度的
+    # 暴露控制比例（模型）和同核实测 scalar 占比（aiv_scalar/aiv_time）求差，给出
+    # 定量赤字。两个分母都归一到单核时间线，匹配可比；µs 估计封顶到 author
+    # headroom (elapsed - t_core_floor)。纯诊断，不改变 bound。
+    if (
+        report.diagnosis == "Insufficient Parallelism"
+        and report.dominant_component == Component.SCALAR
+    ):
+        model_frac, n_sync, _ = _exposed_control_overlap(extract.operations)
+        aiv_time = _float_cell(op_row, "aiv_time(us)")
+        aiv_scalar = _float_cell(op_row, "aiv_scalar_time(us)")
+        measured_frac = aiv_scalar / aiv_time if aiv_time > _EPSILON else 0.0
+        report.exposed_control_frac_model = model_frac
+        report.exposed_control_frac_measured = measured_frac
+        report.exposed_control_deficit_pts = measured_frac - model_frac
+        report.n_sync_ops = n_sync
+        # µs 估计需要 sound 紧 bound 才能诚实封顶；只有调用方提供 t_bound_us 时才给。
+        if t_bound_us is not None:
+            author_headroom_us = elapsed_time_us - t_bound_us
+            if author_headroom_us > 0:
+                raw_us = max(0.0, measured_frac - model_frac) * elapsed_time_us
+                report.exposed_control_deficit_us = min(raw_us, author_headroom_us)
+
+    return report
 
 
 def report_to_dict(report: OperatorBottleneckReport) -> dict:
@@ -491,6 +635,11 @@ def report_to_dict(report: OperatorBottleneckReport) -> dict:
         ),
         "dominant_item": report.dominant_item,
         "dominant_share": report.dominant_share,
+        "exposed_control_frac_model": report.exposed_control_frac_model,
+        "exposed_control_frac_measured": report.exposed_control_frac_measured,
+        "exposed_control_deficit_pts": report.exposed_control_deficit_pts,
+        "exposed_control_deficit_us": report.exposed_control_deficit_us,
+        "n_sync_ops": report.n_sync_ops,
         "components": {
             key: {
                 "component": result.component.value,
@@ -513,18 +662,40 @@ def report_to_dict(report: OperatorBottleneckReport) -> dict:
     }
 
 
+def _row_duration_us(row: dict[str, str]) -> float:
+    return _float_cell(
+        row,
+        "Task Duration(us)",
+        "duration(us)",
+        "Duration(us)",
+        "duration_us",
+    )
+
+
 def _read_op_summary_row(path: str | Path, kernel_name: str | None) -> dict[str, str]:
+    """选取要分析的 op_summary 行。
+
+    一个 grid kernel 在 msprof 里会有多条 shard 行（每个 AI core 一条），它们
+    在不同 core 上**并发**执行。因此墙钟时间应取最长的那条（关键 core），而不是
+    第一条或求和——求和会把并发时间错误地累加。``_float_cell`` 已容忍 'N/A'，
+    所以汇总/表头行的时长会变成 0，不会被误选。
+    """
     with open(path) as f:
         reader = csv.DictReader(line for line in f if not line.strip().startswith("#"))
         rows = list(reader)
     if not rows:
         raise ValueError(f"op_summary 中没有可读取的行: {path}")
     if kernel_name is None:
-        return rows[0]
-    for row in rows:
-        if _cell(row, "Op Name", "op_name", "Name") == kernel_name:
-            return row
-    raise ValueError(f"op_summary 中找不到 kernel: {kernel_name}")
+        candidates = rows
+    else:
+        candidates = [
+            row
+            for row in rows
+            if _cell(row, "Op Name", "op_name", "Name") == kernel_name
+        ]
+        if not candidates:
+            raise ValueError(f"op_summary 中找不到 kernel: {kernel_name}")
+    return max(candidates, key=_row_duration_us)
 
 
 def _cell(row: dict[str, str], *names: str) -> str:
@@ -542,7 +713,12 @@ def _float_cell(row: dict[str, str], *names: str) -> float:
     try:
         return float(value)
     except ValueError:
-        return float(value.split()[0])
+        # 容忍 'N/A'、空白以及带单位后缀的单元格（例如 '12.3 us'）。
+        # msprof 的汇总/表头行常含 'N/A'，按缺失(0.0)处理而不是抛异常。
+        try:
+            return float(value.split()[0])
+        except (ValueError, IndexError):
+            return 0.0
 
 
 def _peak_rate_for_label(
@@ -599,6 +775,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--r-threshold", type=float, default=0.50)
     parser.add_argument("--work-tolerance", type=float, default=0.10)
     parser.add_argument(
+        "--t-bound-us",
+        type=float,
+        default=None,
+        help="Sound loop-scaled bound (us) used only to cap the exposed-control "
+        "deficit us estimate at author headroom (elapsed - t_bound_us).",
+    )
+    parser.add_argument(
         "--output-file",
         default="data/profile_utilization_inputs/profile_utilization_report.json",
         help="Path to write the JSON report",
@@ -613,6 +796,7 @@ def main(argv: list[str] | None = None) -> int:
         u_threshold=args.u_threshold,
         r_threshold=args.r_threshold,
         work_tolerance=args.work_tolerance,
+        t_bound_us=args.t_bound_us,
     )
 
     output = json.dumps(report_to_dict(report), ensure_ascii=False, indent=2)

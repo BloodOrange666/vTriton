@@ -540,3 +540,75 @@ def test_warning_when_u_or_e_is_unphysical():
 
     assert any("U > 1.05" in item for item in report.warnings)
     assert any("E > 1.05" in item for item in report.warnings)
+
+
+# ── Real-kernel coverage: chunk_kda end-to-end through run_from_files ──────────
+#
+# Synthetic tests above never exercise run_from_files on a real msprof export.
+# These pin the post-merge fixes:
+#   - exposed control/sync (high-R Scalar with zero arithmetic work) is routed to
+#     the paper's "Insufficient Parallelism" verdict AND localized to scalar
+#     (the paper's taxonomy would mis-route it to "Inefficient Component");
+#   - the default kernel_name=None path tolerates 'N/A' cells (no crash);
+#   - multi-shard kernels reduce to the longest-duration (critical) row.
+
+import pytest
+
+from perfbound.analyze.profile_utilization import run_from_files
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_CHUNK_KDA_CSV = _FIXTURES / "chunk_kda_op_summary_910b3.csv"
+_KDA_DES = Path(__file__).parents[2] / ".omc" / "research" / "hw_runs" / "kda_des.json"
+
+
+@pytest.mark.skipif(not _KDA_DES.exists(), reason="real kda_des.json not present")
+def test_chunk_kda_exposed_control_is_insufficient_parallelism():
+    """Real chunk_kda: exposed scalar control/sync → Insufficient Parallelism @ scalar."""
+    report = run_from_files(
+        _CHUNK_KDA_CSV, _KDA_DES, None,
+        kernel_name="chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2",
+    )
+    # Paper-faithful verdict, now localized to the exposed control engine.
+    assert report.diagnosis == "Insufficient Parallelism"
+    assert report.dominant_component == Component.SCALAR
+    # Scalar monopolizes the timeline (R≈0.92) but carries zero arithmetic work.
+    scalar = report.component_results["scalar"]
+    assert scalar.r_residency > 0.8
+    assert scalar.work_done == 0.0
+    # The exposed-control rationale is surfaced (not a generic parallelism note).
+    assert any("exposed control/sync" in w for w in report.warnings)
+    # Multi-shard reduction picks the longest-duration row (~104,326 µs), not the
+    # first shard (~104,316 µs).
+    assert report.elapsed_time_us > 104_320.0
+    # Quantified exposed-control/sync deficit (addition beyond the paper):
+    # model exposes ~11.9% control on the DES critical path, hardware exposes
+    # ~84.6% same-core scalar -> deficit ≈ +72.7 pts. Scale-invariant, no bound.
+    assert 0.10 < report.exposed_control_frac_model < 0.15
+    assert 0.83 < report.exposed_control_frac_measured < 0.86
+    assert 0.70 < report.exposed_control_deficit_pts < 0.75
+    assert report.n_sync_ops == 402
+    # deficit_us needs a sound (loop-scaled two-tier) bound; None without one.
+    assert report.exposed_control_deficit_us is None
+
+
+@pytest.mark.skipif(not _KDA_DES.exists(), reason="real kda_des.json not present")
+def test_chunk_kda_exposed_control_deficit_us_capped_at_headroom():
+    """With the sound two-tier bound supplied, deficit_us ≈ 58,216 µs (capped)."""
+    report = run_from_files(
+        _CHUNK_KDA_CSV, _KDA_DES, None,
+        kernel_name="chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2",
+        t_bound_us=46_109.91,  # A.8 loop-scaled two-tier bound
+    )
+    assert report.exposed_control_deficit_us is not None
+    author_headroom = report.elapsed_time_us - 46_109.91
+    # Capped at author headroom, and matches the A.8 Gap-OVL magnitude.
+    assert report.exposed_control_deficit_us <= author_headroom + 1.0
+    assert 57_000.0 < report.exposed_control_deficit_us < 59_000.0
+
+
+@pytest.mark.skipif(not _KDA_DES.exists(), reason="real kda_des.json not present")
+def test_chunk_kda_default_kernel_name_does_not_crash_on_na_cells():
+    """kernel_name=None must tolerate 'N/A' summary cells (regression for the crash)."""
+    report = run_from_files(_CHUNK_KDA_CSV, _KDA_DES, None, kernel_name=None)
+    assert report.diagnosis == "Insufficient Parallelism"
+    assert report.dominant_component == Component.SCALAR
