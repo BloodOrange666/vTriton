@@ -246,6 +246,8 @@ public:
   int getVectorWidthBytes() const;
   llvm::StringRef getVectorComputeSpace() const;
   int getVectorOpCyclesPerInstruction(llvm::StringRef opName) const;
+  double getCostModelParam(llvm::StringRef name, double defaultValue) const;
+  int64_t getCostModelIntParam(llvm::StringRef name, int64_t defaultValue) const;
   std::optional<OpcodeCycleCost>
   lookupOpcodeCycleCost(llvm::StringRef pipeName,
                         llvm::StringRef opName) const;
@@ -377,6 +379,7 @@ private:
   llvm::StringMap<DataMover> dataMovers;
   llvm::StringMap<PipelinePath> pipelinePaths;
   llvm::StringMap<int> vectorOpCyclesPerInstruction;
+  llvm::StringMap<double> costModelParams;
   llvm::StringMap<int> syncOpCycles;
   llvm::StringMap<OpcodeCycleCost> opcodeCycleCosts;
   std::string opcodeCalibrationVersion;
